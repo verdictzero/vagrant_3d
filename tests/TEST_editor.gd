@@ -41,6 +41,8 @@ func _initialize() -> void:
 	await _edit_picks()
 	await _move()
 	await _snap()
+	await _tools()
+	await _transform()
 	await _fingers()
 	await _rows_by_touch()
 	await _popovers()
@@ -262,10 +264,16 @@ func _move() -> void:
 	var after := _vert_screen(a, 2)
 	ok(absf(after.x - (p.x + 60)) < 2.0 and absf(after.y - p.y) < 2.0,
 			"the vertex lands under the pen (%s vs %s)" % [after, p + Vector2(60, 0)])
+	ok(ed.tool_live() and ed.tool_kind() == "TRANSLATE" and ed.tool_window.visible,
+			"a MOVE drag puts the TRANSLATE numbers up")
+	var vals: Array = ed.tool_values()
+	ok((a.global_transform * a.data.verts[2] - a.global_transform * before[2]).is_equal_approx(Vector3(vals[0], vals[1], vals[2])),
+			"and they are the world delta (%s)" % str(vals))
 	# A tap in MOVE still selects.
 	_pen_tap(_vert_screen(a, 5))
 	await _settle()
 	ok(ed.sel_verts.has(5) and ed.sel_verts.size() == 1, "a tap in MOVE picks vertex 5")
+	ok(not ed.tool_live() and not ed.tool_window.visible, "and that tap applied the translate and took the window down")
 	# Object mode: the parent moves and the child comes with it.
 	ed.set_mode(ed.Mode.OBJECT)
 	var b: Node3D = ed.objects()[1]
@@ -341,6 +349,146 @@ func _snap() -> void:
 	ed.snap_on = true
 	ed.pointer = ed.Pointer.SELECT
 	a.global_position = Vector3(-3, 0, 0)
+
+
+func _tools() -> void:
+	var a: Node3D = ed.objects()[0]
+	var b: Node3D = ed.objects()[1]
+	ed.select_object(a)
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.FACE)
+	ed.select_faces({1: true})   # the top
+	await _settle()
+	var p := _row_center(ed.pointer_list, 2)
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.pointer == ed.Pointer.TOOL and ed.popover.visible and ed.popover_kind == "TOOL",
+			"TOOL with a face selected opens the tool list")
+	ok(ed.tool_menu.index_of("EXTRUDE") >= 0 and ed.tool_menu.index_of("EXTRUDE NORMALS") >= 0,
+			"EXTRUDE and EXTRUDE NORMALS are on it")
+	ok(ed.tool_menu.items[ed.tool_menu.index_of("BEVEL")].disabled, "BEVEL is listed and disabled")
+	var row: Vector2 = ed.tool_menu.global_position + ed.tool_menu.row_rect(ed.tool_menu.index_of("EXTRUDE")).get_center()
+	_pen_tap(row)
+	await _settle()
+	ok(not ed.tool_job.is_empty() and ed.tool_window.visible and not ed.popover.visible,
+			"EXTRUDE starts: the list closes, the panel comes up")
+	ok(a.data.face_count() == 10 and a.data.vert_count() == 12, "the top is extruded at zero (%d f, %d v)" % [a.data.face_count(), a.data.vert_count()])
+	ok(ed.sel_faces.size() == 1 and ed.sel_verts.size() == 4, "the new top is the selection")
+	ok(is_zero_approx(ed.tool_value()), "the amount starts at zero")
+	ok(ed.tool_job.props.size() == 1 and ed.tool_job.props[0].label == "AMOUNT", "the window shows one property, AMOUNT")
+	# Pull the slider.
+	var kx: float = ed.tool_window.global_position.x + ed.tool_window.knob_x(0)
+	var ky: float = ed.tool_window.global_position.y + ed.tool_window.row_rect(0).get_center().y
+	_pen_drag(Vector2(kx, ky), Vector2(kx + 90.0, ky))
+	await _settle()
+	ok(ed.tool_value() > 0.0 and _on_grid(Vector3(ed.tool_value(), 0, 0), 0.25),
+			"the slider pulls the amount in 0.25 steps (%.2f)" % ed.tool_value())
+	var at_height := true
+	for i in ed.sel_verts:
+		at_height = at_height and is_equal_approx((a.global_transform * a.data.verts[i]).y, 1.0 + ed.tool_value())
+	ok(at_height, "the new top sits at 1 + the amount")
+	var apply: Vector2 = ed.tool_window.global_position + ed.tool_window.button_rect("APPLY").get_center()
+	_pen_tap(apply)
+	await _settle()
+	ok(ed.tool_job.is_empty() and not ed.tool_window.visible, "APPLY closes the tool")
+	ok(a.data.face_count() == 10, "and keeps the result")
+	ok(ed.sel_faces.size() == 1, "with the new top still selected")
+	# A drag in the view, still in TOOL, extrudes the selection again.
+	var f: int = ed.sel_faces.keys()[0]
+	var c := _screen(a.global_transform * a.data.face_center(f))
+	_pen_drag(c, c + Vector2(80, 0))
+	await _settle()
+	ok(not ed.tool_job.is_empty() and a.data.face_count() == 14 and ed.tool_value() != 0.0,
+			"a drag in the view extrudes again (%d f, %.2f)" % [a.data.face_count(), ed.tool_value()])
+	var cancel: Vector2 = ed.tool_window.global_position + ed.tool_window.button_rect("CANCEL").get_center()
+	_pen_tap(cancel)
+	await _settle()
+	ok(ed.tool_job.is_empty() and a.data.face_count() == 10 and a.data.vert_count() == 12, "CANCEL puts the mesh back")
+	ok(ed.sel_faces.size() == 1 and ed.sel_faces.has(f), "and the selection")
+	ok(a.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size() == 10 * 6, "and the drawn mesh follows")
+	# EXTRUDE NORMALS on an edge of Cube 001 grows a quad.
+	ed.select_object(b)
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.EDGE)
+	ed.select_edges({0: true})
+	ed.tool_start("EXTRUDE NORMALS")
+	ed.tool_set(0, 0.5)
+	ok(b.data.face_count() == 7 and b.data.vert_count() == 10, "an edge grows a quad (%d f, %d v)" % [b.data.face_count(), b.data.vert_count()])
+	ok(ed.sel_edges.size() == 1 and ed.sel_verts.size() == 2, "the new edge is the selection")
+	ed.set_mode(ed.Mode.OBJECT)
+	ok(ed.tool_job.is_empty() and b.data.face_count() == 7, "leaving EDIT applies a live tool")
+	ed.pointer = ed.Pointer.SELECT
+	ed.select_object(a)
+
+
+func _transform() -> void:
+	var a: Node3D = ed.objects()[0]
+	ed.set_mode(ed.Mode.OBJECT)
+	ed.select_object(a)
+	a.global_transform = Transform3D(Basis(), Vector3(-3, 0, 0))
+	ok(ed.tool_start("ROTATE"), "ROTATE starts on an object")
+	ok(ed.tool_window.visible and ed.tool_job.props.size() == 3 and ed.tool_job.props[0].unit == "°",
+			"with X Y Z in degrees")
+	ed.tool_set(1, 92.0)
+	ok(is_equal_approx(ed.tool_value(1), 90.0), "snapped to 5 degree steps (%.1f)" % ed.tool_value(1))
+	ok(a.global_basis.is_equal_approx(Basis.from_euler(Vector3(0, deg_to_rad(90.0), 0))), "the object turned 90 about Y")
+	ok(a.global_position.is_equal_approx(Vector3(-3, 0, 0)), "about its own origin")
+	ed.tool_cancel()
+	ok(a.global_basis.is_equal_approx(Basis()) and not ed.tool_live(), "CANCEL turns it back")
+	ed.tool_start("TRANSLATE")
+	ed.tool_set(0, 1.6)
+	ok(a.global_position.is_equal_approx(Vector3(-1.5, 0, 0)), "TRANSLATE X by slider, snapped 1.6 to 1.5 (%s)" % a.global_position)
+	ed.tool_apply()
+	ok(a.global_position.is_equal_approx(Vector3(-1.5, 0, 0)) and not ed.tool_live(), "APPLY keeps it")
+	# A drag in the view with ROTATE as the tool turns about one axis.
+	ed.pointer = ed.Pointer.TOOL
+	ed.current_tool = "ROTATE"
+	var p := _screen(a.global_position)
+	_pen_drag(p, p + Vector2(100, 0))
+	await _settle()
+	ok(ed.tool_live() and ed.tool_kind() == "ROTATE", "a drag in the view with ROTATE turns")
+	var vals: Array = ed.tool_values()
+	var turned := 0
+	var stepped := true
+	for v in vals:
+		if not is_zero_approx(v):
+			turned += 1
+			stepped = stepped and is_zero_approx(fmod(absf(v), 5.0))
+	ok(turned == 1 and stepped, "about one axis, in 5 degree steps (%s)" % str(vals))
+	ed.tool_cancel()
+	ok(a.global_basis.is_equal_approx(Basis()), "and CANCEL undoes the turn")
+	# Two objects turn about their shared centre.
+	var b: Node3D = ed.objects()[1]
+	a.global_transform = Transform3D(Basis(), Vector3(-3, 0, 0))
+	b.global_transform = Transform3D(Basis(), Vector3(3, 0, 0))
+	ed.select_object(a)
+	ed.select_object(b, true)
+	ed.tool_start("ROTATE")
+	ed.tool_set(1, 180.0)
+	ok(a.global_position.is_equal_approx(Vector3(3, 0, 0)) and b.global_position.is_equal_approx(Vector3(-3, 0, 0)),
+			"two objects turn about their shared centre (%s, %s)" % [a.global_position, b.global_position])
+	ed.tool_cancel()
+	# In EDIT, vertices turn about their own centre.
+	var c: Node3D = ed.add_primitive("CUBE")
+	c.global_position = Vector3(0, 0, 5)
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.VERT)
+	var all := {}
+	for i in 8:
+		all[i] = true
+	ed.select_verts(all)
+	ed.tool_start("ROTATE")
+	ed.tool_set(1, 90.0)
+	ok(c.data.verts[0].is_equal_approx(Vector3(-1, -1, 1)), "all of a cube's verts turned 90 about Y (%s)" % c.data.verts[0])
+	ok(c.global_position.is_equal_approx(Vector3(0, 0, 5)), "without moving the object")
+	ed.tool_cancel()
+	ok(c.data.verts[0].is_equal_approx(Vector3(-1, -1, -1)), "and CANCEL puts them back")
+	ed.set_mode(ed.Mode.OBJECT)
+	ed.select_object(c)
+	ed.delete_selected()
+	ed.pointer = ed.Pointer.SELECT
+	ed.select_object(a)
 
 
 func _popovers() -> void:
@@ -476,7 +624,7 @@ func _rows_by_touch() -> void:
 	_finger(0, p, true)
 	_finger(0, p, false)
 	await _settle()
-	ok(ed.pointer == ed.Pointer.SELECT, "TOOL is disabled: nothing is bound to it yet")
+	ok(ed.pointer == ed.Pointer.SELECT, "TOOL is disabled with nothing selected")
 	p = _row_center(ed.add_list, 3)
 	_finger(0, p, true)
 	_finger(0, p, false)
@@ -500,7 +648,14 @@ func _delete() -> void:
 	ed.select_object(a)
 	ed.set_mode(ed.Mode.EDIT)
 	ed.select_verts({0: true})
+	var v0: int = a.data.vert_count()
+	var f0: int = a.data.face_count()
+	var touching: int = a.data.faces_using_vert(0).size()
 	ed.delete_selected()
-	ok(a.data.vert_count() == 7 and a.data.face_count() == 3, "DELETE in EDIT removes the vertex and its faces")
+	ok(a.data.vert_count() == v0 - 1 and a.data.face_count() == f0 - touching,
+			"DELETE in EDIT removes the vertex and its %d faces (%d v, %d f)" % [touching, a.data.vert_count(), a.data.face_count()])
 	ok(ed.sel_verts.is_empty(), "and nothing is selected after")
-	ok(a.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size() == 18, "the drawn mesh follows")
+	var drawn: int = 0
+	for f in a.data.face_count():
+		drawn += (a.data.faces[f].size() - 2) * 3
+	ok(a.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size() == drawn, "the drawn mesh follows")

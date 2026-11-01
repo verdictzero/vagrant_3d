@@ -59,6 +59,23 @@ func _initialize() -> void:
 	ed.snap_hit = {"point": cyl.global_transform * cyl.data.verts[3], "kind": "VERTEX"}
 	await _frames(6)
 	_shot("edit_vert")
+	ed.snap_hit = {}
+	ed.pen_hover_valid = false
+	ed.set_elem(ed.Elem.FACE)
+	ed.select_faces({1: true})
+	ed.pointer = ed.Pointer.TOOL
+	ed.tool_start("EXTRUDE")
+	ed.tool_set(0, 0.75)
+	await _frames(6)
+	_shot("tool")
+	ed.tool_apply()
+	ed.set_mode(ed.Mode.OBJECT)
+	ed.select_object(cube)
+	ed.tool_start("ROTATE")
+	ed.tool_set(1, 35.0)
+	ed.tool_set(0, -10.0)
+	await _frames(6)
+	_shot("rotate")
 	quit(0)
 
 

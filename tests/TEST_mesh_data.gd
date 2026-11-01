@@ -19,6 +19,7 @@ func _initialize() -> void:
 	_outward()
 	_delete()
 	_mesh()
+	_extrude()
 	print("mesh data: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -85,3 +86,62 @@ func _mesh() -> void:
 	var hit := MeshData.make_cube().ray_hit(Vector3(0, 0, 5), Vector3(0, 0, -1))
 	ok(not hit.is_empty() and hit.face == 4, "a ray from +Z hits the +Z face (%s)" % str(hit))
 	ok(MeshData.make_cube().ray_hit(Vector3(5, 5, 5), Vector3(0, 0, -1)).is_empty(), "a ray that misses, misses")
+
+
+func _outward_all(m: MeshData, centre: Vector3, label: String) -> void:
+	var bad := 0
+	for f in m.face_count():
+		if m.face_normal(f).dot(m.face_center(f) - centre) <= 0.0:
+			bad += 1
+	ok(bad == 0, "%s: every face winds outward (%d did not)" % [label, bad])
+
+
+func _extrude() -> void:
+	# A cube's top, pulled up half a unit: the top rises, four walls appear,
+	# the old top is gone, and the whole is still one closed shell.
+	var m := MeshData.make_cube()
+	var job := m.extrude_begin({}, {}, {1: true}, false)
+	m.extrude_set(job, 0.5)
+	ok(m.vert_count() == 12 and m.edge_count() == 20 and m.face_count() == 10,
+			"cube top extruded: 12 v, 20 e, 10 f (%d, %d, %d)" % [m.vert_count(), m.edge_count(), m.face_count()])
+	ok(m.vert_count() - m.edge_count() + m.face_count() == 2, "and still a closed shell")
+	var risen := true
+	for i in job.moving:
+		risen = risen and is_equal_approx(m.verts[i].y, 1.5)
+	ok(risen and job.moving.size() == 4, "the four new verts sit at y 1.5")
+	ok(job.sel_verts.size() == 4, "and are the selection after")
+	_outward_all(m, Vector3(0, 0.25, 0), "extruded cube")
+	# A plane's one face: the rim grows walls and the floor is gone.
+	m = MeshData.make_plane()
+	job = m.extrude_begin({}, {}, {0: true}, false)
+	m.extrude_set(job, 1.0)
+	ok(m.vert_count() == 8 and m.edge_count() == 12 and m.face_count() == 5,
+			"plane extruded: 8 v, 12 e, 5 f, open underneath (%d, %d, %d)" % [m.vert_count(), m.edge_count(), m.face_count()])
+	ok(job.dir[0].is_equal_approx(Vector3.UP), "along the plane's normal")
+	# Every face, along normals: nothing new, every corner slides out its own diagonal.
+	m = MeshData.make_cube()
+	job = m.extrude_begin({}, {}, {0: true, 1: true, 2: true, 3: true, 4: true, 5: true}, true)
+	m.extrude_set(job, 0.5)
+	ok(m.vert_count() == 8 and m.face_count() == 6, "all faces along normals adds nothing")
+	ok(m.verts[0].is_equal_approx(Vector3(-1, -1, -1) + Vector3(-1, -1, -1).normalized() * 0.5),
+			"and corner 0 moved out along its own normal (%s)" % m.verts[0])
+	# An edge of a plane grows a wall facing out.
+	m = MeshData.make_plane()
+	job = m.extrude_begin({}, {0: true}, {}, false)
+	m.extrude_set(job, 0.5)
+	ok(m.vert_count() == 6 and m.edge_count() == 7 and m.face_count() == 2,
+			"plane edge extruded: 6 v, 7 e, 2 f (%d, %d, %d)" % [m.vert_count(), m.edge_count(), m.face_count()])
+	ok(m.face_normal(1).dot(m.face_center(1)) > 0.0, "the wall faces away from the plane")
+	ok(is_equal_approx(m.verts[4].y, 0.5), "and stands up")
+	# A vertex grows a wire edge.
+	m = MeshData.make_plane()
+	job = m.extrude_begin({0: true}, {}, {}, false)
+	m.extrude_set(job, 0.5)
+	ok(m.vert_count() == 5 and m.edge_count() == 5 and m.face_count() == 1, "a vertex extrudes to a wire edge")
+	ok(m.edge_index(0, 4) >= 0, "joined to where it came from")
+	# copy() is a real copy.
+	var a := MeshData.make_cube()
+	var b := a.copy()
+	b.verts[0] = Vector3(9, 9, 9)
+	b.delete_verts({1: true})
+	ok(a.vert_count() == 8 and a.verts[0] == Vector3(-1, -1, -1) and a.edge_count() == 12, "copy() shares nothing")

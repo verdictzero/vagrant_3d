@@ -227,3 +227,218 @@ func build_mesh() -> ArrayMesh:
 	arrays[Mesh.ARRAY_NORMAL] = nrm
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	return mesh
+
+
+# --- copying and face removal --------------------------------------------------
+
+func copy() -> MeshData:
+	var m := MeshData.new()
+	m.verts = verts.duplicate()
+	m.edges = edges.duplicate()
+	m.faces = faces.duplicate(true)
+	m._edge_index = _edge_index.duplicate()
+	return m
+
+
+## Every face on each edge: Vector2i -> Array of face indices. Edges in no
+## face are wire edges.
+func edge_face_map() -> Dictionary:
+	var out := {}
+	for e in edges:
+		out[e] = []
+	for f in faces.size():
+		var idx := faces[f]
+		for i in idx.size():
+			var a := idx[i]
+			var b := idx[(i + 1) % idx.size()]
+			out[Vector2i(mini(a, b), maxi(a, b))].append(f)
+	return out
+
+
+## Drop the faces in `which` (a set). Edges are rebuilt from what remains;
+## wire edges survive.
+func remove_faces(which: Dictionary) -> void:
+	var efm := edge_face_map()
+	var wires: Array[Vector2i] = []
+	for e in efm:
+		if efm[e].is_empty():
+			wires.append(e)
+	var kept: Array[PackedInt32Array] = []
+	for f in faces.size():
+		if not which.has(f):
+			kept.append(faces[f])
+	faces = []
+	edges = []
+	_edge_index = {}
+	for f in kept:
+		add_face(f)
+	for e in wires:
+		_add_edge(e.x, e.y)
+
+
+## Area-weighted normal (Newell, not normalised): long faces count more.
+func face_normal_raw(f: int) -> Vector3:
+	var idx := faces[f]
+	var n := Vector3.ZERO
+	for i in idx.size():
+		var a := verts[idx[i]]
+		var b := verts[idx[(i + 1) % idx.size()]]
+		n += (a - b).cross(a + b)
+	return n
+
+
+## The normal at vertex `v`: the faces in `among` (a set, or all faces when
+## empty) that use it, averaged. UP when no face does.
+func vertex_normal(v: int, among: Dictionary = {}) -> Vector3:
+	var n := Vector3.ZERO
+	for f in faces.size():
+		if (among.is_empty() or among.has(f)) and faces[f].has(v):
+			n += face_normal(f)
+	return n.normalized() if n.length_squared() > 0.0 else Vector3.UP
+
+
+## True when face `f` runs a then b in its winding.
+func face_runs(f: int, a: int, b: int) -> bool:
+	var idx := faces[f]
+	for i in idx.size():
+		if idx[i] == a and idx[(i + 1) % idx.size()] == b:
+			return true
+	return false
+
+
+# --- extrude -------------------------------------------------------------------
+#
+# Two steps, so a slider can pull the result live: `extrude_begin` builds the
+# new topology at zero offset and says which vertices move and which way;
+# `extrude_set` puts them at an offset. Cancel is the caller's: it keeps a
+# copy() from before.
+#
+# What gets extruded follows the selection the way Blender picks: whole
+# faces when any are selected (a region: its rim grows walls and its inside
+# comes along), else edges (each grows a quad), else vertices (each grows a
+# wire edge). EXTRUDE moves everything along one direction, the region's
+# normal; EXTRUDE NORMALS moves each vertex along its own.
+
+## Returns { moving: PackedInt32Array, base: PackedVector3Array,
+##           dir: PackedVector3Array, sel_verts: Dictionary }.
+func extrude_begin(sel_v: Dictionary, sel_e: Dictionary, sel_f: Dictionary,
+		along_normals: bool) -> Dictionary:
+	if not sel_f.is_empty():
+		return _extrude_faces(sel_f, along_normals)
+	if not sel_e.is_empty():
+		return _extrude_edges(sel_e, along_normals)
+	return _extrude_verts(sel_v)
+
+
+func extrude_set(job: Dictionary, amount: float) -> void:
+	var moving: PackedInt32Array = job.moving
+	var base: PackedVector3Array = job.base
+	var dir: PackedVector3Array = job.dir
+	for i in moving.size():
+		verts[moving[i]] = base[i] + dir[i] * amount
+
+
+func _extrude_faces(sel_f: Dictionary, along_normals: bool) -> Dictionary:
+	# Rim edges: in exactly one selected face. Rim vertices are duplicated so
+	# the walls have something to stand on; inside vertices move in place.
+	var in_region := {}
+	var rim: Array = []          # [a, b] as the selected face runs them
+	var region_verts := {}
+	for f in sel_f:
+		var idx := faces[f]
+		for i in idx.size():
+			var a := idx[i]
+			var b := idx[(i + 1) % idx.size()]
+			region_verts[a] = true
+			var key := Vector2i(mini(a, b), maxi(a, b))
+			in_region[key] = in_region.get(key, 0) + 1
+	for f in sel_f:
+		var idx := faces[f]
+		for i in idx.size():
+			var a := idx[i]
+			var b := idx[(i + 1) % idx.size()]
+			if in_region[Vector2i(mini(a, b), maxi(a, b))] == 1:
+				rim.append([a, b])
+	var rim_verts := {}
+	for e in rim:
+		rim_verts[e[0]] = true
+		rim_verts[e[1]] = true
+	# Directions are taken before anything moves or is renumbered.
+	var region_n := Vector3.ZERO
+	for f in sel_f:
+		region_n += face_normal_raw(f)
+	region_n = region_n.normalized() if region_n.length_squared() > 0.0 else Vector3.UP
+	var dirs := {}
+	for v in region_verts:
+		dirs[v] = vertex_normal(v, sel_f) if along_normals else region_n
+	var map := {}
+	for v in region_verts:
+		map[v] = add_vert(verts[v]) if rim_verts.has(v) else v
+	var new_faces: Array[PackedInt32Array] = []
+	for f in sel_f:
+		var nf := PackedInt32Array()
+		for i in faces[f]:
+			nf.append(map[i])
+		new_faces.append(nf)
+	remove_faces(sel_f)
+	for nf in new_faces:
+		add_face(nf)
+	for e in rim:
+		add_face(PackedInt32Array([e[0], e[1], map[e[1]], map[e[0]]]))
+	return _job(map, dirs)
+
+
+func _extrude_edges(sel_e: Dictionary, along_normals: bool) -> Dictionary:
+	var efm := edge_face_map()
+	var edge_list: Array[Vector2i] = []
+	var ev := {}
+	for e in sel_e:
+		edge_list.append(edges[e])
+		ev[edges[e].x] = true
+		ev[edges[e].y] = true
+	var common := Vector3.ZERO
+	for e in edge_list:
+		for f in efm[e]:
+			common += face_normal(f)
+	common = common.normalized() if common.length_squared() > 0.0 else Vector3.UP
+	var dirs := {}
+	for v in ev:
+		dirs[v] = vertex_normal(v) if along_normals else common
+	var map := {}
+	for v in ev:
+		map[v] = add_vert(verts[v])
+	for e in edge_list:
+		var a := e.x
+		var b := e.y
+		# Run the edge the way its face does, so the quad faces away from it.
+		for f in efm[e]:
+			if face_runs(f, b, a):
+				a = e.y
+				b = e.x
+			break
+		add_face(PackedInt32Array([a, b, map[b], map[a]]))
+	return _job(map, dirs)
+
+
+func _extrude_verts(sel_v: Dictionary) -> Dictionary:
+	var dirs := {}
+	var map := {}
+	for v in sel_v:
+		dirs[v] = vertex_normal(v)
+	for v in sel_v:
+		map[v] = add_vert(verts[v])
+		_add_edge(v, map[v])
+	return _job(map, dirs)
+
+
+func _job(map: Dictionary, dirs: Dictionary) -> Dictionary:
+	var moving := PackedInt32Array()
+	var base := PackedVector3Array()
+	var dir := PackedVector3Array()
+	var sel := {}
+	for v in map:
+		moving.append(map[v])
+		base.append(verts[map[v]])
+		dir.append(dirs[v])
+		sel[map[v]] = true
+	return {"moving": moving, "base": base, "dir": dir, "sel_verts": sel}

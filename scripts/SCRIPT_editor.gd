@@ -15,6 +15,7 @@ const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
 const Rows := preload("res://scripts/SCRIPT_row_list.gd")
 const Overlay := preload("res://scripts/SCRIPT_viewport_overlay.gd")
 const Grid := preload("res://scripts/SCRIPT_matcap_grid.gd")
+const ToolWin := preload("res://scripts/SCRIPT_tool_window.gd")
 
 enum Mode { OBJECT, EDIT }
 enum Elem { VERT, EDGE, FACE }
@@ -30,6 +31,11 @@ const TAP_TIME := 0.35
 const POPOVER_W := 272.0
 
 const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
+const TOOLS := ["TRANSLATE", "ROTATE", "EXTRUDE", "EXTRUDE NORMALS"]
+const TOOLS_LATER := ["BEVEL", "INSET"]
+const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
+const ROT_DEG_PER_PX := 0.5
+const ROT_STEP := 5.0
 const STEPS := [1.0, 0.5, 0.25, 0.1]
 
 # --- state -------------------------------------------------------------------
@@ -64,6 +70,15 @@ var snap_absolute := true     # positions land ON the grid, not just in steps of
 var snap_self := false        # in EDIT, the object's own unselected elements count
 var snap_hit: Dictionary = {} # {point, kind} while a move is held to a target
 
+# Tools. One runs at a time, live, until APPLY or CANCEL (or anything that
+# changes the selection or mode, which applies it). See "tools" below.
+var current_tool := "TRANSLATE"
+var tool_job: Dictionary = {}
+var _tool_backup: MeshData
+var _tool_sel_backup: Array = []
+var _tool_drag_from: Array = []
+var _tool_drag_origin := Vector2.ZERO
+
 # --- nodes -------------------------------------------------------------------
 
 @onready var world_root: Node3D = $Scene
@@ -82,7 +97,9 @@ var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
 var snap_menu: RowList
+var tool_menu: RowList
 var matcap_grid: MatcapGrid
+var tool_window: ToolWindow
 var _headings: Array[Label] = []
 
 # --- gesture bookkeeping -----------------------------------------------------
@@ -95,6 +112,8 @@ var _pen_down := false
 var _pen_start := Vector2.ZERO
 var _pen_dragging := false
 var _pen_moving := false
+var _pen_tooling := false
+var _finger_tooling := false
 var _middle_down := false
 var _move_plane := Plane()
 var _move_start := Vector3.ZERO
@@ -188,7 +207,7 @@ func _build_ui() -> void:
 			{"id": "FACE", "text": "FACE", "icon": &"face"}], _on_elem_tapped)
 	pointer_list = _bar([{"id": "SELECT", "text": "SELECT", "icon": &"select"},
 			{"id": "MOVE", "text": "MOVE", "icon": &"move"},
-			{"id": "TOOL", "text": "TOOL", "icon": &"tool", "disabled": true}], _on_pointer_tapped)
+			{"id": "TOOL", "text": "TOOL", "icon": &"tool"}], _on_pointer_tapped)
 	toggle_list = _bar([{"id": "SNAP", "text": "SNAP", "icon": &"snap", "lit": true},
 			{"id": "SHADING", "text": "SHADING", "icon": &"shading"}], _on_toggle_tapped)
 
@@ -204,6 +223,21 @@ func _build_ui() -> void:
 	snap_menu.position = Vector2(4.0, 8.0)
 	snap_menu.visible = false
 	ui.add_child(snap_menu)
+	tool_menu = Rows.new()
+	tool_menu.tapped.connect(_on_tool_tapped)
+	var tools: Array[Dictionary] = []
+	for t in TOOLS:
+		tools.append({"id": t, "text": t})
+	for t in TOOLS_LATER:
+		tools.append({"id": t, "text": t, "disabled": true})
+	tool_menu.set_items(tools)
+	tool_menu.visible = false
+	ui.add_child(tool_menu)
+	tool_window = ToolWin.new()
+	tool_window.value_changed.connect(tool_set)
+	tool_window.applied.connect(tool_apply)
+	tool_window.cancelled.connect(tool_cancel)
+	ui.add_child(tool_window)
 	matcap_grid = Grid.new()
 	matcap_grid.picked.connect(_on_matcap_picked)
 	matcap_grid.visible = false
@@ -260,6 +294,7 @@ func _layout() -> void:
 	# What is left is the view.
 	var top := m + BAR_H + T.GUTTER
 	view_rect = Rect2(m, top, rx - T.GUTTER - m, s.y - top - m)
+	_place_tool_window()
 	_place_popover()
 
 
@@ -280,6 +315,11 @@ func _refresh_lists() -> void:
 		it.disabled = mode == Mode.OBJECT
 	elem_list.set_active(["VERT", "EDGE", "FACE"][elem] if mode == Mode.EDIT else null)
 	pointer_list.set_active(["SELECT", "MOVE", "TOOL"][pointer])
+	pointer_list.items[2].disabled = tool_job.is_empty() and not has_moveable()
+	pointer_list.queue_redraw()
+	for it in tool_menu.items:
+		it.disabled = not tool_available(it.id)
+	tool_menu.queue_redraw()
 	toggle_list.items[0].lit = snap_on
 	toggle_list.set_active(popover_kind if popover.visible else null)
 	add_list.items[add_list.items.size() - 1].disabled = sel_objects.is_empty() \
@@ -354,6 +394,7 @@ func open_popover(kind: String) -> void:
 	popover_kind = kind
 	popover.visible = true
 	snap_menu.visible = kind == "SNAP"
+	tool_menu.visible = kind == "TOOL"
 	matcap_grid.visible = kind == "SHADING"
 	_refresh_snap_menu()
 	matcap_grid.set_active(SceneObject.matcap_index)
@@ -366,6 +407,7 @@ func close_popover() -> void:
 		return
 	popover.visible = false
 	snap_menu.visible = false
+	tool_menu.visible = false
 	matcap_grid.visible = false
 	_refresh_lists()
 
@@ -373,16 +415,21 @@ func close_popover() -> void:
 func _place_popover() -> void:
 	if not popover.visible:
 		return
-	var i := toggle_list.index_of(popover_kind)
-	var anchor := toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
+	var anchor: Vector2
+	if popover_kind == "TOOL":
+		anchor = pointer_list.position + pointer_list.row_rect(pointer_list.index_of("TOOL")).position
+	else:
+		var i := toggle_list.index_of(popover_kind)
+		anchor = toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
 	var top := view_rect.position.y - 2.0
-	if popover_kind == "SNAP":
-		snap_menu.size = Vector2(POPOVER_W - 8.0, 0.0)
-		var h: float = snap_menu.content_size().y
+	if popover_kind == "SNAP" or popover_kind == "TOOL":
+		var menu: RowList = snap_menu if popover_kind == "SNAP" else tool_menu
+		menu.size = Vector2(POPOVER_W - 8.0, 0.0)
+		var h: float = menu.content_size().y
 		popover.size = Vector2(POPOVER_W, h + 16.0)
 		popover.position = Vector2(minf(anchor.x, view_rect.end.x - POPOVER_W), top)
-		snap_menu.position = popover.position + Vector2(4.0, 8.0)
-		snap_menu.size = Vector2(POPOVER_W - 8.0, h)
+		menu.position = popover.position + Vector2(4.0, 8.0)
+		menu.size = Vector2(POPOVER_W - 8.0, h)
 	else:
 		var g := MatcapGrid.grid_size()
 		popover.size = g + Vector2(T.PAD * 2, T.PAD * 2)
@@ -467,7 +514,262 @@ func _on_elem_tapped(id: Variant) -> void:
 
 func _on_pointer_tapped(id: Variant) -> void:
 	pointer = {"SELECT": Pointer.SELECT, "MOVE": Pointer.MOVE, "TOOL": Pointer.TOOL}[id]
+	if id == "TOOL":
+		open_popover("TOOL")
+	elif popover.visible and popover_kind == "TOOL":
+		close_popover()
 	_refresh_lists()
+
+
+func _on_tool_tapped(id: Variant) -> void:
+	current_tool = id
+	close_popover()
+	tool_start()
+
+
+# --- tools ---------------------------------------------------------------------
+#
+# A tool is a JOB: { kind, props, ... }. Its props are what the tool window
+# shows and what its sliders edit; the job knows how to put the selection
+# where the props say (`_tool_apply_props`), from a record of where things
+# were when it started. One job at a time, live until APPLY or CANCEL;
+# anything that moves on from the selection applies it first.
+#
+#   TRANSLATE        X Y Z, world units. A MOVE drag is this tool.
+#   ROTATE           X Y Z, degrees, about the selection's centre
+#   EXTRUDE          AMOUNT along the region's normal   (EDIT only)
+#   EXTRUDE NORMALS  AMOUNT along each vertex's own     (EDIT only)
+
+func tool_available(kind: String) -> bool:
+	match kind:
+		"TRANSLATE", "ROTATE":
+			return has_moveable()
+		"EXTRUDE", "EXTRUDE NORMALS":
+			return mode == Mode.EDIT and active_object != null and not sel_verts.is_empty()
+	return false
+
+
+func tool_live() -> bool:
+	return not tool_job.is_empty()
+
+
+func tool_kind() -> String:
+	return tool_job.get("kind", "")
+
+
+func tool_values() -> Array:
+	var out := []
+	for p in tool_job.get("props", []):
+		out.append(p.value)
+	return out
+
+
+func tool_value(i: int = 0) -> float:
+	return tool_job.props[i].value if tool_live() else 0.0
+
+
+## Start `kind` on the selection, at zero, and put the window up.
+func tool_start(kind: String = current_tool) -> bool:
+	_tool_finish()
+	if not tool_available(kind):
+		return false
+	current_tool = kind
+	var job := {"kind": kind}
+	match kind:
+		"EXTRUDE", "EXTRUDE NORMALS":
+			_tool_backup = active_object.data.copy()
+			_tool_sel_backup = [sel_verts.duplicate(), sel_edges.duplicate(), sel_faces.duplicate()]
+			job.extrude = active_object.data.extrude_begin(sel_verts, sel_edges, sel_faces,
+					kind == "EXTRUDE NORMALS")
+			job.props = [_prop("AMOUNT", 2.0, "", 2)]
+			active_object.rebuild()
+			tool_job = job
+			select_verts(job.extrude.sel_verts)
+		"TRANSLATE":
+			_tool_record_starts(job)
+			job.props = [_prop("X", 4.0, "", 2), _prop("Y", 4.0, "", 2), _prop("Z", 4.0, "", 2)]
+			tool_job = job
+		"ROTATE":
+			_tool_record_starts(job)
+			job.props = [_prop("X", 180.0, "°", 1), _prop("Y", 180.0, "°", 1), _prop("Z", 180.0, "°", 1)]
+			tool_job = job
+	tool_window.show_tool(kind, tool_job.props)
+	_place_tool_window()
+	_refresh_lists()
+	return true
+
+
+static func _prop(label: String, span: float, unit: String, decimals: int) -> Dictionary:
+	return {"label": label, "value": 0.0, "span": span, "unit": unit, "decimals": decimals}
+
+
+## Where everything was when a transform started, and the pivot it turns on.
+func _tool_record_starts(job: Dictionary) -> void:
+	var pivot := Vector3.ZERO
+	_move_obj_start.clear()
+	_moving_set.clear()
+	if mode == Mode.OBJECT:
+		var roots := _move_roots()
+		for o in roots:
+			_move_obj_start[o] = o.global_transform
+			pivot += o.global_position
+		pivot /= float(maxi(roots.size(), 1))
+		for o in objects():
+			for r in roots:
+				if o == r or o.is_descendant_of(r):
+					_moving_set[o] = true
+	else:
+		_move_vert_start = active_object.data.verts.duplicate()
+		for i in sel_verts:
+			pivot += active_object.global_transform * _move_vert_start[i]
+		pivot /= float(maxi(sel_verts.size(), 1))
+		_moving_set[active_object] = true
+	_move_pivot = pivot
+	job.pivot = pivot
+
+
+## One property from its slider (snapped); the selection follows.
+func tool_set(index: int, v: float) -> void:
+	if not tool_live():
+		return
+	tool_job.props[index].value = _tool_snap(v)
+	_tool_apply_props()
+
+
+## All three of a transform's properties at once, from a drag that has
+## already done its own snapping.
+func tool_set_vector(v: Vector3) -> void:
+	if not tool_live() or tool_job.props.size() != 3:
+		return
+	tool_job.props[0].value = v.x
+	tool_job.props[1].value = v.y
+	tool_job.props[2].value = v.z
+	_tool_apply_props()
+
+
+func _tool_snap(v: float) -> float:
+	if not (snap_on and snap_targets.INCREMENT):
+		return v
+	return snappedf(v, ROT_STEP if tool_kind() == "ROTATE" else snap_step)
+
+
+func _tool_apply_props() -> void:
+	var vals := tool_values()
+	match tool_kind():
+		"EXTRUDE", "EXTRUDE NORMALS":
+			active_object.data.extrude_set(tool_job.extrude, vals[0])
+			active_object.rebuild()
+		"TRANSLATE":
+			_apply_translate(Vector3(vals[0], vals[1], vals[2]))
+		"ROTATE":
+			_apply_rotate(Vector3(vals[0], vals[1], vals[2]))
+	tool_window.set_values(vals)
+
+
+func _apply_translate(delta: Vector3) -> void:
+	if mode == Mode.OBJECT:
+		for o in _move_obj_start:
+			if is_instance_valid(o):
+				var start: Transform3D = _move_obj_start[o]
+				o.global_transform = Transform3D(start.basis, start.origin + delta)
+		return
+	var o := active_object
+	var local := o.global_transform.basis.inverse() * delta
+	for i in sel_verts:
+		o.data.verts[i] = _move_vert_start[i] + local
+	o.rebuild()
+
+
+func _apply_rotate(degrees: Vector3) -> void:
+	var r := Basis.from_euler(degrees * (PI / 180.0))
+	var pivot: Vector3 = tool_job.pivot
+	var about := Transform3D(r, pivot - r * pivot)
+	if mode == Mode.OBJECT:
+		for o in _move_obj_start:
+			if is_instance_valid(o):
+				o.global_transform = about * _move_obj_start[o]
+		return
+	var o := active_object
+	var xf := o.global_transform
+	var inv := xf.affine_inverse()
+	for i in sel_verts:
+		o.data.verts[i] = inv * (about * (xf * _move_vert_start[i]))
+	o.rebuild()
+
+
+func tool_apply() -> void:
+	if not tool_live():
+		return
+	tool_job = {}
+	_tool_backup = null
+	_move_obj_start.clear()
+	_moving_set.clear()
+	snap_hit = {}
+	tool_window.visible = false
+	_refresh_lists()
+
+
+func tool_cancel() -> void:
+	if not tool_live():
+		return
+	match tool_kind():
+		"EXTRUDE", "EXTRUDE NORMALS":
+			active_object.data = _tool_backup
+			active_object.rebuild()
+			sel_verts = _tool_sel_backup[0]
+			sel_edges = _tool_sel_backup[1]
+			sel_faces = _tool_sel_backup[2]
+		"TRANSLATE", "ROTATE":
+			if mode == Mode.OBJECT:
+				for o in _move_obj_start:
+					if is_instance_valid(o):
+						o.global_transform = _move_obj_start[o]
+			else:
+				active_object.data.verts = _move_vert_start.duplicate()
+				active_object.rebuild()
+	tool_apply()
+
+
+## Anything that moves on from the selection applies a live tool first.
+func _tool_finish() -> void:
+	if tool_live():
+		tool_apply()
+
+
+func _place_tool_window() -> void:
+	# Above the status line, which stays readable under it.
+	tool_window.position = Vector2(view_rect.position.x + 12.0,
+			view_rect.end.y - 30.0 - tool_window.size.y)
+
+
+## A drag in the view with TOOL as the pointer: start the current tool if
+## none is running, then the drag drives it. EXTRUDE's amount and ROTATE's
+## angle follow the pointer sideways, scaled to the camera's distance so a
+## hand's width means about the same at any zoom; ROTATE turns about the
+## world axis the camera looks down most. TRANSLATE is the MOVE drag.
+func _tool_drag_begin(origin: Vector2) -> bool:
+	if not tool_live() and not tool_start(current_tool):
+		return false
+	_tool_drag_origin = origin
+	_tool_drag_from = tool_values()
+	if tool_kind() == "TRANSLATE":
+		_move_plane = Plane(camera().global_basis.z, _move_pivot)
+		var prior := Vector3(_tool_drag_from[0], _tool_drag_from[1], _tool_drag_from[2])
+		_move_start = _plane_point(origin, _move_pivot) - prior
+	return true
+
+
+func _tool_drag_update(pos: Vector2) -> void:
+	var dx := pos.x - _tool_drag_origin.x
+	match tool_kind():
+		"EXTRUDE", "EXTRUDE NORMALS":
+			tool_set(0, _tool_drag_from[0] + dx * orbit.distance * TOOL_UNITS_PER_PX)
+		"ROTATE":
+			var fwd := camera().global_basis.z.abs()
+			var axis := 0 if fwd.x >= fwd.y and fwd.x >= fwd.z else (1 if fwd.y >= fwd.z else 2)
+			tool_set(axis, _tool_drag_from[axis] + dx * ROT_DEG_PER_PX)
+		"TRANSLATE":
+			move_update(pos)
 
 
 # --- commands ------------------------------------------------------------------
@@ -480,6 +782,7 @@ func add_primitive(kind: String) -> SceneObject:
 		"CYLINDER": data = MeshData.make_cylinder()
 		"SPHERE": data = MeshData.make_sphere()
 		_: return null
+	_tool_finish()
 	var o := SceneObject.create(_unique_name(kind.capitalize()), data)
 	world_root.add_child(o)
 	mode = Mode.OBJECT
@@ -491,6 +794,7 @@ func add_primitive(kind: String) -> SceneObject:
 ## centre and they become its children, keeping their place in the world.
 ## With nothing selected it is an empty group at the origin.
 func add_group() -> SceneObject:
+	_tool_finish()
 	var g := SceneObject.create_group(_unique_name("Group"))
 	var roots := _move_roots() if mode == Mode.OBJECT else []
 	if roots.is_empty():
@@ -530,12 +834,14 @@ func reparent_object(o: SceneObject, target: Node) -> bool:
 		return false
 	if o.get_parent() == target:
 		return false
+	_tool_finish()
 	o.reparent(target, true)
 	_refresh_lists()
 	return true
 
 
 func select_object(o: SceneObject, add := false) -> void:
+	_tool_finish()
 	if not add:
 		sel_objects.clear()
 	if o != null and not sel_objects.has(o):
@@ -549,6 +855,7 @@ func select_object(o: SceneObject, add := false) -> void:
 
 
 func clear_object_selection() -> void:
+	_tool_finish()
 	sel_objects.clear()
 	active_object = null
 	_clear_elems()
@@ -560,6 +867,7 @@ func clear_object_selection() -> void:
 func set_mode(m: Mode) -> void:
 	if m == Mode.EDIT and (active_object == null or not active_object.has_mesh()):
 		return
+	_tool_finish()
 	mode = m
 	hover_kind = -1
 	hover_object = null
@@ -573,6 +881,7 @@ func set_elem(e: Elem) -> void:
 
 
 func delete_selected() -> void:
+	_tool_finish()
 	if mode == Mode.OBJECT:
 		var doomed := sel_objects.duplicate()
 		clear_object_selection()
@@ -750,6 +1059,7 @@ func tap(pos: Vector2, radius: float) -> void:
 		else:
 			select_object(o)
 		return
+	_tool_finish()
 	var i := pick_elem(pos, radius)
 	match elem:
 		Elem.VERT: select_verts({i: true} if i >= 0 else {})
@@ -778,6 +1088,7 @@ func box_select(rect: Rect2) -> void:
 			active_object = sel_objects[0]
 		_refresh_lists()
 		return
+	_tool_finish()
 	var d := active_object.data
 	var inside := {}
 	for i in d.verts.size():
@@ -820,6 +1131,9 @@ func update_hover(pos: Vector2, radius: float) -> void:
 
 
 # --- moving --------------------------------------------------------------------
+# The MOVE drag is the TRANSLATE tool with a pointer on it: the drag's
+# position on a plane through the pivot, facing the camera, is where the
+# pivot goes, snapped to whatever is under the pointer or to the grid.
 
 func has_moveable() -> bool:
 	if mode == Mode.OBJECT:
@@ -842,28 +1156,10 @@ func _move_roots() -> Array[SceneObject]:
 
 
 func move_begin(pos: Vector2) -> void:
-	var pivot := Vector3.ZERO
-	_move_obj_start.clear()
-	_moving_set.clear()
-	if mode == Mode.OBJECT:
-		var roots := _move_roots()
-		for o in roots:
-			_move_obj_start[o] = o.global_position
-			pivot += o.global_position
-		pivot /= float(maxi(roots.size(), 1))
-		for o in objects():
-			for r in roots:
-				if o == r or o.is_descendant_of(r):
-					_moving_set[o] = true
-	else:
-		_move_vert_start = active_object.data.verts.duplicate()
-		for i in sel_verts:
-			pivot += active_object.global_transform * _move_vert_start[i]
-		pivot /= float(maxi(sel_verts.size(), 1))
-		_moving_set[active_object] = true
-	_move_pivot = pivot
-	_move_plane = Plane(camera().global_basis.z, pivot)
-	_move_start = _plane_point(pos, pivot)
+	if not tool_start("TRANSLATE"):
+		return
+	_move_plane = Plane(camera().global_basis.z, _move_pivot)
+	_move_start = _plane_point(pos, _move_pivot)
 	snap_hit = {}
 
 
@@ -889,6 +1185,18 @@ func move_target(pos: Vector2) -> Vector3:
 			return free.snapped(Vector3.ONE * snap_step)
 		return _move_pivot + (free - _move_pivot).snapped(Vector3.ONE * snap_step)
 	return free
+
+
+func move_update(pos: Vector2) -> void:
+	if tool_kind() != "TRANSLATE":
+		return
+	tool_set_vector(move_target(pos) - _move_pivot)
+
+
+## The pointer let go; the job stays live, with its numbers up, until
+## something moves on.
+func move_end() -> void:
+	snap_hit = {}
 
 
 ## The nearest snappable thing to `pos` within SNAP_RADIUS, on anything that
@@ -956,26 +1264,6 @@ func _face_moving(d: MeshData, f: int) -> bool:
 	return false
 
 
-func move_update(pos: Vector2) -> void:
-	var delta := move_target(pos) - _move_pivot
-	if mode == Mode.OBJECT:
-		for o in _move_obj_start:
-			if is_instance_valid(o):
-				o.global_position = _move_obj_start[o] + delta
-		return
-	var o := active_object
-	var local := o.global_transform.basis.inverse() * delta
-	for i in sel_verts:
-		o.data.verts[i] = _move_vert_start[i] + local
-	o.rebuild()
-
-
-func move_end() -> void:
-	_move_obj_start.clear()
-	_moving_set.clear()
-	snap_hit = {}
-
-
 # --- input ---------------------------------------------------------------------
 # A gesture that began in the view keeps its pointer until it lifts, even when
 # it crosses a panel: those continuations are taken in `_input`, ahead of the
@@ -996,7 +1284,8 @@ func _input(event: InputEvent) -> void:
 		elif click != null and click.pressed and click.button_index == MOUSE_BUTTON_LEFT:
 			press_pos = click.position
 		if press_pos != null and not popover.get_rect().has_point(press_pos) \
-				and not toggle_list.get_rect().has_point(press_pos):
+				and not toggle_list.get_rect().has_point(press_pos) \
+				and not pointer_list.get_rect().has_point(press_pos):
 			close_popover()
 			get_viewport().set_input_as_handled()
 			return
@@ -1044,6 +1333,7 @@ func _touch(t: InputEventScreenTouch) -> void:
 			if _finger_moving:
 				move_end()
 				_finger_moving = false
+			_finger_tooling = false
 			_pinch_reset()
 		elif _touches.size() > 2:
 			_touches[t.index].cancelled = true
@@ -1052,6 +1342,9 @@ func _touch(t: InputEventScreenTouch) -> void:
 		return
 	var info: Dictionary = _touches[t.index]
 	_touches.erase(t.index)
+	if _finger_tooling and _touches.is_empty():
+		_finger_tooling = false
+		return
 	if _finger_moving and _touches.is_empty():
 		move_end()
 		_finger_moving = false
@@ -1077,12 +1370,18 @@ func _touch_drag(d: InputEventScreenDrag) -> void:
 		var moved: bool = info.pos.distance_to(info.start) > TAP_SLOP
 		if _finger_moving:
 			move_update(d.position)
+		elif _finger_tooling:
+			_tool_drag_update(d.position)
 		elif pointer == Pointer.MOVE and has_moveable():
 			if moved:
 				_finger_moving = true
 				move_begin(info.start)
 				move_update(d.position)
-		elif pointer != Pointer.TOOL:
+		elif pointer == Pointer.TOOL:
+			if moved and _tool_drag_begin(info.start):
+				_finger_tooling = true
+				_tool_drag_update(d.position)
+		else:
 			orbit.orbit(d.position - prev)
 	elif _touches.size() == 2:
 		var keys := _touches.keys()
@@ -1123,10 +1422,13 @@ func _pen_button(c: InputEventMouseButton) -> void:
 				_pen_start = c.position
 				_pen_dragging = false
 				_pen_moving = false
+				_pen_tooling = false
 			elif _pen_down:
 				_pen_down = false
 				if _pen_moving:
 					move_end()
+				elif _pen_tooling:
+					_pen_tooling = false
 				elif box_active:
 					box_active = false
 					box_select(box_rect())
@@ -1159,10 +1461,14 @@ func _pen_motion(m: InputEventMouseMotion) -> void:
 		if pointer == Pointer.MOVE and has_moveable():
 			_pen_moving = true
 			move_begin(_pen_start)
-		elif pointer != Pointer.TOOL:
+		elif pointer == Pointer.TOOL:
+			_pen_tooling = _tool_drag_begin(_pen_start)
+		else:
 			box_active = true
 			_box_from = _pen_start
 	if _pen_moving:
 		move_update(m.position)
+	elif _pen_tooling:
+		_tool_drag_update(m.position)
 	elif box_active:
 		_box_to = m.position

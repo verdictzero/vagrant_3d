@@ -19,6 +19,7 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 | `scripts/SCRIPT_icons.gd` | Blender's icon vocabulary redrawn as mono line glyphs |
 | `scripts/SCRIPT_matcaps.gd`, `scripts/SCRIPT_matcap_grid.gd` | The sixteen matcaps and the gallery |
 | `shaders/SHADER_matcap.gdshader` | The matcap shader |
+| `scripts/SCRIPT_tool_window.gd` | The tool window: a slider and a number per property, APPLY, CANCEL |
 | `scripts/SCRIPT_viewport_overlay.gd` | Wires, selection, hover, the box, the snap mark, group axes, the status line |
 | `scripts/SCRIPT_chamfer_panel.gd` | The cut-corner frame |
 | `scripts/SCRIPT_ui_tokens.gd` | The greys and sizes, by name |
@@ -48,7 +49,7 @@ between them (`project.godot` `[input_devices]`).
 | Hover | — | crosshair; the element under it brightens |
 | Middle drag / wheel | — | orbit / zoom, for a desk |
 
-TOOL is on the bar and disabled: nothing is bound to it yet.
+TOOL is live whenever something is selected; see Tools.
 
 ## Hierarchy
 
@@ -76,6 +77,30 @@ On by default. SNAP on the bar opens the menu:
 | SNAP TO SELF | In EDIT, the object's own unselected vertices, edges and faces count as targets |
 
 While a move is held to a target, a square mark sits on it in the view.
+
+## Tools and the tool window
+
+Select something (objects, or vertices, edges or faces), tap TOOL, pick a
+tool. It runs at once at zero and the **tool window** comes up in the
+bottom-left of the view: the tool's name, one row per property with a
+slider to pull and the value as a number, then APPLY and CANCEL. Every tool
+uses the same window; it only differs in which rows it shows. A drag in the
+view while TOOL is the pointer drives the tool too, and starts the current
+one if none is running. With snapping on, lengths go in STEP increments and
+angles in 5 degree steps. Anything that moves on, such as another
+selection, a mode change or another tool, applies the live one first.
+
+| Tool | Rows | Does |
+|---|---|---|
+| TRANSLATE | X Y Z | Moves the selection by a world offset. **A MOVE drag is this tool**: the window comes up with the live offset and stays for fine adjustment |
+| ROTATE | X Y Z, degrees | Turns the selection about its centre. A drag in the view turns about the world axis the camera looks down most |
+| EXTRUDE | AMOUNT | Faces: the region rises along its normal, its rim grows walls, the old faces go. Edges: each grows a quad. Vertices: each grows a wire edge |
+| EXTRUDE NORMALS | AMOUNT | The same, but every vertex moves along its own normal |
+| BEVEL, INSET | | Listed, not built yet |
+
+`scripts/SCRIPT_tool_window.gd` is the window; the jobs are in
+`scripts/SCRIPT_editor.gd` under "tools", and the extrude operations are
+`MeshData.extrude_begin` / `extrude_set` in `scripts/SCRIPT_mesh_data.gd`.
 
 ## Shading
 
