@@ -13,6 +13,9 @@ config_version=5
 config/name="Vagrant 3D"
 run/main_scene="res://scenes/SCENE_editor.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
+; A white cube on white with black edges, cut down the middle, the right
+; half inverted. tools/TOOL_make_app_icon.py draws it and the launcher layers.
+config/icon="res://ui/UI_app_icon_256.png"
 ; Android's back key does not quit the editor.
 config/quit_on_go_back=false
 
