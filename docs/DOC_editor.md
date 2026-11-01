@@ -1,26 +1,38 @@
-# The editor, chunk one
+# The editor
 
-Objects in a hierarchy, four primitives, OBJECT and EDIT mode with VERT /
-EDGE / FACE, SELECT and MOVE. Android first, S Pen aware. The UI speaks the
-house style: `DOC_ui_style.md` is the why, `DOC_ui_design_tokens.md` the
-numbers.
+Objects and groups in a hierarchy, four primitives, OBJECT and EDIT mode
+with VERT / EDGE / FACE, SELECT and MOVE, snapping, matcaps. Android first,
+S Pen aware, laid out for a tablet or a foldable. The UI speaks the house
+style: `DOC_ui_style.md` is the why, `DOC_ui_design_tokens.md` the numbers.
+This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 
 ## What's where
 
 | Path | Role |
 |---|---|
 | `scenes/SCENE_editor.tscn` | The one scene |
-| `scripts/SCRIPT_editor.gd` | Modes, selection, picking, moving, gestures, the layout |
+| `scripts/SCRIPT_editor.gd` | Modes, selection, picking, moving, snapping, gestures, popovers, the layout |
 | `scripts/SCRIPT_mesh_data.gd` | `MeshData`: verts, edges, faces; the primitives; the ArrayMesh |
-| `scripts/SCRIPT_scene_object.gd` | `SceneObject`: a Node3D with a MeshData. The hierarchy is the node tree |
+| `scripts/SCRIPT_scene_object.gd` | `SceneObject`: a Node3D with a MeshData, or a group. The hierarchy is the node tree. The shared matcap material |
 | `scripts/SCRIPT_orbit_camera.gd` | Orbit, pan, zoom |
-| `scripts/SCRIPT_row_list.gd` | Rows with one cursor box; tap, hold-or-drag to lift a row |
-| `scripts/SCRIPT_viewport_overlay.gd` | Wires, selection, hover, the box, the status line |
+| `scripts/SCRIPT_row_list.gd` | Rows with one cursor box: icons, tree lines, values, on/off marks; tap, hold-or-drag to lift a row |
+| `scripts/SCRIPT_icons.gd` | Blender's icon vocabulary redrawn as mono line glyphs |
+| `scripts/SCRIPT_matcaps.gd`, `scripts/SCRIPT_matcap_grid.gd` | The sixteen matcaps and the gallery |
+| `shaders/SHADER_matcap.gdshader` | The matcap shader |
+| `scripts/SCRIPT_viewport_overlay.gd` | Wires, selection, hover, the box, the snap mark, group axes, the status line |
 | `scripts/SCRIPT_chamfer_panel.gd` | The cut-corner frame |
 | `scripts/SCRIPT_ui_tokens.gd` | The greys and sizes, by name |
 | `scripts/autoload/AUTOLOAD_fonts.gd` | `Fonts.ui()` words, `Fonts.clock()` numbers |
-| `tests/TEST_*.gd` | Headless, below |
+| `vendor/matcaps/` | The matcaps; `SOURCES.txt` says where from |
+| `tests/TEST_*.gd`, `tests/RENDER_editor.gd` | Headless tests and the screenshot harness, below |
 | `tools/TOOL_build_apk.sh` | Writes the export preset and builds the APK |
+
+## The screen
+
+Mode bar across the top: OBJECT / EDIT, then VERT / EDGE / FACE, then
+SELECT / MOVE / TOOL, and at the right end the two toggles, SNAP and
+SHADING, which open popovers under the bar. Hierarchy down the right with
+ADD under it. The view is what is left.
 
 ## Pointers
 
@@ -43,7 +55,32 @@ TOOL is on the bar and disabled: nothing is bound to it yet.
 Tap a row to select the object. Press and hold, or drag sideways, to lift a
 row; drop it on another row to parent under it, keeping its place in the
 world; drop it below the rows to send it back to the root. An object cannot
-be dropped on its own descendant.
+be dropped on its own descendant. Children hang off a `|_` line under their
+parent, and a parent with more children below carries its line past them.
+
+**Groups** are objects with no mesh. ADD > GROUP with objects selected wraps
+them: the group sits at their centre and they become its children. With
+nothing selected it is an empty group at the origin. A group shows as plain
+axes in the view and can be picked by them; it cannot be edited.
+
+## Snapping
+
+On by default. SNAP on the bar opens the menu:
+
+| Row | Does |
+|---|---|
+| SNAP | The whole thing on or off; the bar's SNAP is lit while on |
+| INCREMENT / VERTEX / EDGE / FACE | What to snap to; any mix. A vertex under the pointer beats an edge beats a face; none of them within reach falls back to the increment |
+| STEP | The increment: 1 / 0.5 / 0.25 / 0.1, tapped round |
+| ABSOLUTE GRID | On: positions land on the grid. Off: moves go in steps from where they started |
+| SNAP TO SELF | In EDIT, the object's own unselected vertices, edges and faces count as targets |
+
+While a move is held to a target, a square mark sits on it in the view.
+
+## Shading
+
+SHADING opens the gallery: sixteen matcaps, the clay grey first and the
+default. One tap changes every object; there is one material.
 
 ## Tests
 

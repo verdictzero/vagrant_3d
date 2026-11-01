@@ -22,10 +22,11 @@ Fonts="*res://scripts/autoload/AUTOLOAD_fonts.gd"
 
 [display]
 
-; The 1280x720 design space every pixel measurement in docs/ is quoted in.
-; canvas_items + expand: a wider phone gets a wider viewport, nothing stretches.
-window/size/viewport_width=1280
-window/size/viewport_height=720
+; The 1600x900 design space: the style sheet's 1280x720 at 0.8, for a tablet
+; or a foldable. canvas_items + expand: a wider or taller screen gets a bigger
+; viewport, nothing stretches.
+window/size/viewport_width=1600
+window/size/viewport_height=900
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 ; 4 = sensor landscape: either way up, never portrait.

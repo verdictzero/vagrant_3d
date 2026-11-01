@@ -71,6 +71,16 @@ func _mesh() -> void:
 	ok(m.get_surface_count() == 1, "cube builds one surface")
 	var arrays := m.surface_get_arrays(0)
 	ok(arrays[Mesh.ARRAY_VERTEX].size() == 36, "cube is 12 triangles (%d verts)" % arrays[Mesh.ARRAY_VERTEX].size())
+	# Godot's front faces wind clockwise: each drawn triangle's right-hand
+	# normal must point AGAINST the face normal it carries.
+	var pos: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var nrm: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+	var wrong := 0
+	for t in range(0, pos.size(), 3):
+		var rh := (pos[t + 1] - pos[t]).cross(pos[t + 2] - pos[t])
+		if rh.dot(nrm[t]) > 0.0:
+			wrong += 1
+	ok(wrong == 0, "every drawn triangle winds clockwise for Godot (%d did not)" % wrong)
 	ok(MeshData.new().build_mesh().get_surface_count() == 0, "an empty mesh builds nothing")
 	var hit := MeshData.make_cube().ray_hit(Vector3(0, 0, 5), Vector3(0, 0, -1))
 	ok(not hit.is_empty() and hit.face == 4, "a ray from +Z hits the +Z face (%s)" % str(hit))

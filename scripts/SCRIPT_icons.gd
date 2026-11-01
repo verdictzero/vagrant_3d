@@ -1,0 +1,90 @@
+class_name Icons
+extends RefCounted
+## Blender's icon vocabulary, redrawn as monochrome line glyphs in the house
+## style: one stroke weight, square or 45-degree corners, no curves (a sphere
+## is an octagon). Redrawn rather than copied: Blender's icon sheet is GPL,
+## and these strokes are what the style wants anyway. Each glyph is a list of
+## ops in a unit square:
+##   ["l", x1, y1, x2, y2]      a line
+##   ["p", [x, y, ...]]         an open polyline
+##   ["c", [x, y, ...]]         a closed outline
+##   ["f", [x, y, ...], alpha]  a filled polygon at a fraction of the colour
+##   ["d", x, y, s]             a square dot of side s (lit)
+##   ["w", x1, y1, x2, y2]      a wide line (the lit edge)
+
+const OCT := [0.5, 0.1, 0.78, 0.22, 0.9, 0.5, 0.78, 0.78, 0.5, 0.9, 0.22, 0.78, 0.1, 0.5, 0.22, 0.22]
+const CUBE_HEX := [0.5, 0.08, 0.9, 0.29, 0.9, 0.71, 0.5, 0.92, 0.1, 0.71, 0.1, 0.29]
+
+const GLYPHS := {
+	# Modes.
+	&"object": [["c", CUBE_HEX], ["l", 0.5, 0.5, 0.1, 0.29], ["l", 0.5, 0.5, 0.9, 0.29], ["l", 0.5, 0.5, 0.5, 0.92]],
+	&"edit": [["c", CUBE_HEX], ["l", 0.5, 0.5, 0.1, 0.29], ["l", 0.5, 0.5, 0.9, 0.29], ["l", 0.5, 0.5, 0.5, 0.92],
+		["d", 0.5, 0.08, 0.2], ["d", 0.9, 0.29, 0.2], ["d", 0.9, 0.71, 0.2], ["d", 0.5, 0.92, 0.2],
+		["d", 0.1, 0.71, 0.2], ["d", 0.1, 0.29, 0.2], ["d", 0.5, 0.5, 0.2]],
+	# Elements: Blender's quad with the picked part lit.
+	&"vert": [["c", [0.18, 0.18, 0.82, 0.18, 0.82, 0.82, 0.18, 0.82]], ["d", 0.18, 0.18, 0.3]],
+	&"edge": [["c", [0.18, 0.18, 0.82, 0.18, 0.82, 0.82, 0.18, 0.82]], ["w", 0.18, 0.18, 0.82, 0.18],
+		["d", 0.18, 0.18, 0.22], ["d", 0.82, 0.18, 0.22]],
+	&"face": [["f", [0.18, 0.18, 0.82, 0.18, 0.82, 0.82, 0.18, 0.82], 0.45],
+		["c", [0.18, 0.18, 0.82, 0.18, 0.82, 0.82, 0.18, 0.82]]],
+	# Pointer sub-modes.
+	&"select": [["c", [0.22, 0.1, 0.22, 0.8, 0.4, 0.63, 0.54, 0.92, 0.66, 0.86, 0.53, 0.58, 0.78, 0.58]]],
+	&"move": [["l", 0.5, 0.1, 0.5, 0.9], ["l", 0.1, 0.5, 0.9, 0.5],
+		["p", [0.36, 0.24, 0.5, 0.1, 0.64, 0.24]], ["p", [0.36, 0.76, 0.5, 0.9, 0.64, 0.76]],
+		["p", [0.24, 0.36, 0.1, 0.5, 0.24, 0.64]], ["p", [0.76, 0.36, 0.9, 0.5, 0.76, 0.64]]],
+	&"tool": [["w", 0.2, 0.8, 0.56, 0.44],
+		["c", [0.5, 0.38, 0.62, 0.12, 0.88, 0.12, 0.88, 0.38, 0.74, 0.38, 0.74, 0.26, 0.62, 0.26, 0.62, 0.5]]],
+	# Bar toggles.
+	&"snap": [["p", [0.22, 0.9, 0.22, 0.42, 0.3, 0.24, 0.5, 0.14, 0.7, 0.24, 0.78, 0.42, 0.78, 0.9]],
+		["p", [0.4, 0.9, 0.4, 0.48, 0.5, 0.38, 0.6, 0.48, 0.6, 0.9]],
+		["l", 0.22, 0.7, 0.4, 0.7], ["l", 0.6, 0.7, 0.78, 0.7]],
+	&"shading": [["c", OCT], ["d", 0.36, 0.34, 0.14], ["p", [0.26, 0.66, 0.44, 0.78, 0.66, 0.74]]],
+	# Hierarchy row types.
+	&"mesh": [["c", [0.5, 0.12, 0.9, 0.86, 0.1, 0.86]], ["d", 0.5, 0.12, 0.22], ["d", 0.9, 0.86, 0.22], ["d", 0.1, 0.86, 0.22]],
+	&"group": [["c", [0.16, 0.4, 0.84, 0.4, 0.84, 0.88, 0.16, 0.88]], ["c", [0.1, 0.2, 0.9, 0.2, 0.9, 0.4, 0.1, 0.4]],
+		["l", 0.4, 0.58, 0.6, 0.58]],
+	# Primitives and actions.
+	&"plane": [["c", [0.1, 0.74, 0.36, 0.26, 0.9, 0.26, 0.64, 0.74]]],
+	&"cube": [["c", CUBE_HEX], ["l", 0.5, 0.5, 0.1, 0.29], ["l", 0.5, 0.5, 0.9, 0.29], ["l", 0.5, 0.5, 0.5, 0.92]],
+	&"cylinder": [["c", [0.16, 0.26, 0.32, 0.14, 0.68, 0.14, 0.84, 0.26, 0.68, 0.38, 0.32, 0.38]],
+		["l", 0.16, 0.26, 0.16, 0.74], ["l", 0.84, 0.26, 0.84, 0.74], ["p", [0.16, 0.74, 0.32, 0.86, 0.68, 0.86, 0.84, 0.74]]],
+	&"sphere": [["c", OCT], ["p", [0.1, 0.5, 0.26, 0.6, 0.74, 0.6, 0.9, 0.5]]],
+	&"delete": [["l", 0.18, 0.26, 0.82, 0.26], ["l", 0.4, 0.14, 0.6, 0.14],
+		["p", [0.26, 0.26, 0.31, 0.88, 0.69, 0.88, 0.74, 0.26]], ["l", 0.43, 0.4, 0.45, 0.76], ["l", 0.57, 0.4, 0.55, 0.76]],
+	&"check": [["p", [0.18, 0.52, 0.42, 0.76, 0.82, 0.26]]],
+	&"x": [["l", 0.2, 0.2, 0.8, 0.8], ["l", 0.8, 0.2, 0.2, 0.8]],
+}
+
+
+static func has(glyph: StringName) -> bool:
+	return GLYPHS.has(glyph)
+
+
+static func draw(ci: CanvasItem, glyph: StringName, rect: Rect2, col: Color, width := 1.5) -> void:
+	var ops: Array = GLYPHS.get(glyph, [])
+	var o := rect.position
+	var s := rect.size
+	for op in ops:
+		match op[0]:
+			"l":
+				ci.draw_line(o + Vector2(op[1], op[2]) * s, o + Vector2(op[3], op[4]) * s, col, width, true)
+			"w":
+				ci.draw_line(o + Vector2(op[1], op[2]) * s, o + Vector2(op[3], op[4]) * s, col, width * 2.2, true)
+			"p":
+				ci.draw_polyline(_pts(op[1], o, s), col, width, true)
+			"c":
+				var pts := _pts(op[1], o, s)
+				pts.append(pts[0])
+				ci.draw_polyline(pts, col, width, true)
+			"f":
+				ci.draw_colored_polygon(_pts(op[1], o, s), Color(col.r, col.g, col.b, col.a * float(op[2])))
+			"d":
+				var half := float(op[3]) * s * 0.5
+				ci.draw_rect(Rect2(o + Vector2(op[1], op[2]) * s - half, half * 2.0), col, true)
+
+
+static func _pts(flat: Array, o: Vector2, s: Vector2) -> PackedVector2Array:
+	var out := PackedVector2Array()
+	for i in range(0, flat.size(), 2):
+		out.append(o + Vector2(flat[i], flat[i + 1]) * s)
+	return out

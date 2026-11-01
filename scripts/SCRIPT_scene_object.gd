@@ -1,14 +1,17 @@
 class_name SceneObject
 extends Node3D
-## One object in the scene: a MeshData and the MeshInstance3D that shows it.
+## One object in the scene: a MeshData and the MeshInstance3D that shows it,
+## or a GROUP, which is an object with no mesh that exists to hold children.
 ## The hierarchy IS the node tree: a child SceneObject is a parented object.
 
-const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
+const MATCAP_SHADER := preload("res://shaders/SHADER_matcap.gdshader")
 
-static var _material: StandardMaterial3D
+static var _material: ShaderMaterial
+static var matcap_index := 0
 
 var data: MeshData
 var mesh_instance: MeshInstance3D
+var is_group := false
 
 
 static func create(object_name: String, mesh_data: MeshData) -> SceneObject:
@@ -17,22 +20,38 @@ static func create(object_name: String, mesh_data: MeshData) -> SceneObject:
 	o.data = mesh_data
 	o.mesh_instance = MeshInstance3D.new()
 	o.mesh_instance.name = "Mesh"
-	o.mesh_instance.material_override = _clay()
+	o.mesh_instance.material_override = material()
 	o.add_child(o.mesh_instance)
 	o.rebuild()
 	return o
 
 
-static func _clay() -> StandardMaterial3D:
+static func create_group(object_name: String) -> SceneObject:
+	var o := create(object_name, MeshData.new())
+	o.is_group = true
+	return o
+
+
+## The one matcap material every object shares.
+static func material() -> ShaderMaterial:
 	if _material == null:
-		_material = StandardMaterial3D.new()
-		_material.albedo_color = T.CLAY
-		_material.roughness = 1.0
+		_material = ShaderMaterial.new()
+		_material.shader = MATCAP_SHADER
+		set_matcap(matcap_index)
 	return _material
+
+
+static func set_matcap(i: int) -> void:
+	matcap_index = i
+	material().set_shader_parameter("matcap", Matcaps.texture(i))
 
 
 func rebuild() -> void:
 	mesh_instance.mesh = data.build_mesh()
+
+
+func has_mesh() -> bool:
+	return not is_group and data != null and data.face_count() > 0
 
 
 ## Direct SceneObject children, in tree order.

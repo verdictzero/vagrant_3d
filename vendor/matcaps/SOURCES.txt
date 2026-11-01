@@ -1,0 +1,23 @@
+Sixteen matcaps picked from github.com/nidorx/matcaps (the /256 folder),
+a collection gathered from the ZBrush Central matcap repository, Pixologic's
+library and BadKing. Its README gives no single licence and says the original
+authors could not be traced; the filenames there are the images' main colours.
+Treat these as "free to use, provenance unknown" until each one is traced.
+
+ours		theirs
+MATCAP_00_clay_grey.png	4F4F4F_9C9C9C_121212_7C7C7C-256px.png
+MATCAP_01_clay_light.png	626262_A8A8A8_949494_1F1F1F-256px.png
+MATCAP_02_soft_grey.png	9D9D9D_4E4E4E_646464_6C6C6C-256px.png
+MATCAP_03_porcelain.png	2A2A2A_B3B3B3_6D6D6D_848C8C-256px.png
+MATCAP_04_dark_rim.png	1B1B1B_999999_575757_747474-256px.png
+MATCAP_05_chrome.png	474843_CECEC4_898883_A3A3A4-256px.png
+MATCAP_06_dark_metal.png	636363_AAAAAA_949494_252525-256px.png
+MATCAP_07_matte_black.png	0F0F0F_4B4B4B_1C1C1C_2C2C2C-256px.png
+MATCAP_08_red_clay.png	BD0D0D_970404_7B0404_550404-256px.png
+MATCAP_09_orange.png	DC3E04_B52604_FC7D20_F85F04-256px.png
+MATCAP_10_gold.png	C35C04_F9C30C_EE9F04_E08304-256px.png
+MATCAP_11_green.png	54C104_BBFA0F_97EF04_7AE104-256px.png
+MATCAP_12_teal.png	046363_0CC3C3_049B9B_04ACAC-256px.png
+MATCAP_13_blue.png	496DBA_94C9F2_72A7E2_84B4EC-256px.png
+MATCAP_14_purple.png	495CA6_CCD2E6_A5B1D8_1E2852-256px.png
+MATCAP_15_skin.png	B67F6B_4B2E2A_6C3A34_F3DBC6-256px.png

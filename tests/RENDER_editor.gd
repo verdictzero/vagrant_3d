@@ -1,12 +1,13 @@
 extends SceneTree
 ## Screenshots of the editor, for looking at. Needs a real renderer:
 ##
-##   xvfb-run -a -s "-screen 0 1280x720x24" godot --path . --rendering-driver opengl3 \
-##       --audio-driver Dummy --resolution 1280x720 \
+##   xvfb-run -a -s "-screen 0 1600x900x24" godot --path . --rendering-driver opengl3 \
+##       --audio-driver Dummy --resolution 1600x900 \
 ##       --script res://tests/RENDER_editor.gd -- --out=/tmp/shots
 ##
-## Writes object.png (two objects, one selected), edit_face.png (a face),
-## edit_vert.png (a box's worth of verts, the pen hovering).
+## Writes object.png (a group, two meshes, one selected), snap.png (the snap
+## menu), shading.png (the gallery, gold picked), edit_vert.png (a box's
+## worth of verts, the pen hovering, held to a vertex).
 
 const SCENE := "res://scenes/SCENE_editor.tscn"
 
@@ -27,25 +28,35 @@ func _initialize() -> void:
 	var cyl = ed.add_primitive("CYLINDER")
 	sphere.global_position = Vector3(3, 0, 0)
 	cyl.global_position = Vector3(-3, 0, -1)
-	ed.reparent_object(sphere, cube)
+	ed.select_object(cube)
+	ed.select_object(sphere, true)
+	ed.add_group()
 	ed.select_object(cube)
 	ed.select_object(cyl, true)
 	ed.active_object = cube
 	ed._refresh_lists()
 	await _frames(6)
 	_shot("object")
-	ed.set_mode(ed.Mode.EDIT)
-	ed.set_elem(ed.Elem.FACE)
-	ed.select_faces({ed.pick_face(ed.camera().unproject_position(cube.global_position)): true})
+	ed.open_popover("SNAP")
 	await _frames(6)
-	_shot("edit_face")
+	_shot("snap")
+	ed.close_popover()
+	ed.open_popover("SHADING")
+	ed._on_matcap_picked(10)
+	await _frames(6)
+	_shot("shading")
+	ed.close_popover()
+	ed._on_matcap_picked(0)
+	ed.set_mode(ed.Mode.EDIT)
 	ed.set_elem(ed.Elem.VERT)
 	ed.select_verts({4: true, 5: true, 6: true, 7: true})
 	ed.pointer = ed.Pointer.MOVE
 	ed._refresh_lists()
-	ed.update_hover(ed.camera().unproject_position(cube.global_transform * cube.data.verts[1]), 14.0)
+	var hover: Vector2 = ed.camera().unproject_position(cube.global_transform * cube.data.verts[1])
+	ed.update_hover(hover, 12.0)
 	ed.pen_hover_valid = true
-	ed.pen_hover_pos = ed.camera().unproject_position(cube.global_transform * cube.data.verts[1])
+	ed.pen_hover_pos = hover
+	ed.snap_hit = {"point": cyl.global_transform * cyl.data.verts[3], "kind": "VERTEX"}
 	await _frames(6)
 	_shot("edit_vert")
 	quit(0)

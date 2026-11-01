@@ -1,8 +1,9 @@
 class_name ViewportOverlay
 extends Control
 ## Everything drawn over the 3D view: wires, selection, hover, the box, the
-## status line. It reads the editor's state each frame and draws nothing of
-## its own. Depth is ignored on purpose: this is the x-ray wire.
+## snap mark, group markers, the status line. It reads the editor's state
+## each frame and draws nothing of its own. Depth is ignored on purpose: this
+## is the x-ray wire.
 
 const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
 
@@ -11,6 +12,7 @@ var editor: Node   # SCRIPT_editor.gd
 const DOT := 3.0
 const SEL_DOT := 7.0
 const HOVER_DOT := 5.0
+const GROUP_AXIS := 0.5
 
 
 func _ready() -> void:
@@ -26,6 +28,7 @@ func _draw() -> void:
 	if editor == null:
 		return
 	var cam: Camera3D = editor.camera()
+	_draw_groups(cam)
 	if editor.mode == editor.Mode.OBJECT:
 		_draw_object_mode(cam)
 	else:
@@ -34,6 +37,12 @@ func _draw() -> void:
 		var r: Rect2 = editor.box_rect()
 		draw_rect(r, T.SEL_BG, true)
 		draw_rect(r, T.COL_CURSOR, false, 1.0)
+	if not editor.snap_hit.is_empty():
+		var w: Vector3 = editor.snap_hit.point
+		if not cam.is_position_behind(w):
+			var p := cam.unproject_position(w)
+			draw_rect(Rect2(p - Vector2(7, 7), Vector2(14, 14)), T.KEYLINE, false, 3.0)
+			draw_rect(Rect2(p - Vector2(7, 7), Vector2(14, 14)), T.COL_CURSOR, false, 1.5)
 	if editor.pen_hover_valid:
 		var p: Vector2 = editor.pen_hover_pos
 		draw_line(p + Vector2(-10, 0), p + Vector2(-3, 0), T.COL_NAME, 1.0)
@@ -41,6 +50,30 @@ func _draw() -> void:
 		draw_line(p + Vector2(0, -10), p + Vector2(0, -3), T.COL_NAME, 1.0)
 		draw_line(p + Vector2(0, 3), p + Vector2(0, 10), T.COL_NAME, 1.0)
 	_draw_status()
+
+
+## Groups have no mesh: they show as plain axes at their origin, lit when
+## selected.
+func _draw_groups(cam: Camera3D) -> void:
+	for o in editor.objects():
+		if not o.is_group:
+			continue
+		var col := T.COL_DIM
+		var w := 1.0
+		if o == editor.active_object:
+			col = T.COL_CURSOR
+			w = 1.5
+		elif editor.sel_objects.has(o):
+			col = T.COL_READY
+		elif o == editor.hover_object:
+			col = T.COL_TAG
+		var xf: Transform3D = o.global_transform
+		for axis in [Vector3.RIGHT, Vector3.UP, Vector3.BACK]:
+			var a: Vector3 = xf * (axis * -GROUP_AXIS)
+			var b: Vector3 = xf * (axis * GROUP_AXIS)
+			if cam.is_position_behind(a) or cam.is_position_behind(b):
+				continue
+			draw_line(cam.unproject_position(a), cam.unproject_position(b), col, w)
 
 
 func _draw_object_mode(cam: Camera3D) -> void:
@@ -132,7 +165,7 @@ func _draw_status() -> void:
 	var x := view.position.x + 8.0
 	var words: String = editor.status_words()
 	draw_string(ui, Vector2(x, y), words, HORIZONTAL_ALIGNMENT_LEFT, -1, T.FS_HINT, T.COL_TAG)
-	var counts: Array = editor.status_counts()   # [["V", 8], ["E", 12], ["F", 6]]
+	var counts: Array = editor.status_counts()   # [["V", 8], ["E", "04/12"], ...]
 	var rx := view.end.x - 8.0
 	for i in range(counts.size() - 1, -1, -1):
 		var v = counts[i][1]

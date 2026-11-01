@@ -25,15 +25,27 @@ func _initialize() -> void:
 	ed = (load(SCENE) as PackedScene).instantiate()
 	root.add_child(ed)
 	await _settle()
-	ok(root.get_visible_rect().size == Vector2(1280, 720), "the canvas is 1280x720 (%s)" % root.get_visible_rect().size)
-	ok(ed.view_rect.position.x > 280 and ed.view_rect.end.y <= 720, "the view sits right of the column, under the bar (%s)" % ed.view_rect)
+	ok(root.get_visible_rect().size == Vector2(1600, 900), "the canvas is 1600x900 (%s)" % root.get_visible_rect().size)
+	ok(ed.view_rect.end.x < ed.hierarchy.global_position.x and ed.view_rect.position.y > ed.top_panel.size.y,
+			"the view sits left of the hierarchy, under the bar (%s)" % ed.view_rect)
+	ok(ed.view_rect.end.y <= 900 and ed.view_rect.position.x >= 12, "and inside the canvas")
+	ok(ed.snap_on and ed.snap_targets.INCREMENT and ed.snap_absolute, "snapping is on by default: increment, absolute grid")
+	for l in [ed.mode_list, ed.elem_list, ed.pointer_list, ed.toggle_list]:
+		var centred := true
+		for i in l.items.size():
+			var r: Rect2 = l.row_rect(i)
+			centred = centred and absf(r.size.x - (l._content_width(l.items[i]) + 24.0)) < 0.5
+		ok(centred, "bar rows are their content plus equal padding either side")
 	await _hierarchy()
 	await _pen_picks()
 	await _edit_picks()
 	await _move()
+	await _snap()
 	await _fingers()
 	await _rows_by_touch()
+	await _popovers()
 	await _delete()
+	await _groups()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -129,6 +141,8 @@ func _hierarchy() -> void:
 	await _settle()
 	ok(b.get_parent() == a, "Cube 001 dropped on Cube is its child")
 	ok(ed.hierarchy.items[1].depth == 1, "and its row is indented")
+	ok(ed.hierarchy.items[1].last and ed.hierarchy.items[1].tree == [false], "it is the last child, under a parent with no siblings after it")
+	ok(ed.hierarchy.items[0].icon == &"mesh", "a mesh row carries the mesh glyph")
 	ok(b.global_position.is_equal_approx(Vector3(3, 0, 0)), "it kept its place in the world")
 	ok(not ed.reparent_object(a, b), "a parent cannot be dropped on its own child")
 	ok(a.get_parent() == ed.world_root, "and stays where it was")
@@ -176,8 +190,8 @@ func _pen_picks() -> void:
 	await _settle()
 	ok(ed.sel_objects.size() == 2, "a box around both selects both (%d)" % ed.sel_objects.size())
 	ok(not ed.box_active, "the box is gone after release")
-	# Panels are not the view: a tap on the left column does not reach it.
-	_pen_tap(Vector2(40, 400))
+	# Panels are not the view: a tap on the right column does not reach it.
+	_pen_tap(Vector2(ed.hierarchy.global_position.x + 40, 400))
 	await _settle()
 	ok(ed.sel_objects.size() == 2, "a tap on the panel does not clear the view's selection")
 
@@ -230,6 +244,7 @@ func _edit_picks() -> void:
 
 func _move() -> void:
 	var a: Node3D = ed.objects()[0]
+	ed.snap_on = false
 	ed.set_elem(ed.Elem.VERT)
 	ed.pointer = ed.Pointer.MOVE
 	var before: PackedVector3Array = a.data.verts.duplicate()
@@ -265,6 +280,148 @@ func _move() -> void:
 	ok((b.global_position - a.global_position).is_equal_approx(b0 - a0), "its child keeps its offset")
 	ed.pointer = ed.Pointer.SELECT
 	ed.reparent_object(b, ed.world_root)
+	ed.snap_on = true
+
+
+func _on_grid(v: Vector3, step: float) -> bool:
+	for c in [v.x, v.y, v.z]:
+		var r: float = fmod(absf(c) + step * 0.5, step) - step * 0.5
+		if absf(r) > 0.001:
+			return false
+	return true
+
+
+func _snap() -> void:
+	var a: Node3D = ed.objects()[0]
+	var b: Node3D = ed.objects()[1]
+	ed.orbit.distance = 8.0
+	ed.orbit.target = Vector3.ZERO
+	ed.orbit.apply()
+	a.global_position = Vector3(-3, 0, 0)
+	b.global_position = Vector3(3, 0, 0)
+	ed.pointer = ed.Pointer.MOVE
+	ed.select_object(a)
+	await _settle()
+	# Increment, absolute: wherever the pen lets go, the object is on the grid.
+	var p := _screen(a.global_position)
+	_pen_drag(p, p + Vector2(37, 11))
+	await _settle()
+	ok(a.global_position != Vector3(-3, 0, 0), "the drag moved Cube")
+	ok(_on_grid(a.global_position, 0.25), "and left it on the 0.25 grid (%s)" % a.global_position)
+	# Vertex: let go over a vertex of Cube 001 and the origin lands on it.
+	ed.snap_targets.VERTEX = true
+	var target: Vector3 = b.global_transform * b.data.verts[0]
+	p = _screen(a.global_position)
+	var q := _screen(target)
+	_pen(p, true)
+	_pen_move(p, p.lerp(q, 0.5), true)
+	_pen_move(p.lerp(q, 0.5), q, true)
+	ok(ed.snap_hit.get("kind", "") == "VERTEX", "held over a vertex, the snap mark is a vertex")
+	_pen(q, false)
+	await _settle()
+	ok(a.global_position.is_equal_approx(target), "and Cube's origin lands on it (%s vs %s)" % [a.global_position, target])
+	ok(ed.snap_hit.is_empty(), "the mark goes when the pen lifts")
+	ed.snap_targets.VERTEX = false
+	# Relative increment: the move is in steps, the position need not be on the grid.
+	a.global_position = Vector3(-3.1, 0, 0)
+	ed.snap_absolute = false
+	p = _screen(a.global_position)
+	_pen_drag(p, p + Vector2(37, 11))
+	await _settle()
+	ok(_on_grid(a.global_position - Vector3(-3.1, 0, 0), 0.25) and not _on_grid(a.global_position, 0.25),
+			"relative increment moves in steps off the grid (%s)" % a.global_position)
+	ed.snap_absolute = true
+	# Off: free.
+	ed.snap_on = false
+	a.global_position = Vector3(-3, 0, 0)
+	p = _screen(a.global_position)
+	_pen_drag(p, p + Vector2(37, 11))
+	await _settle()
+	ok(not _on_grid(a.global_position, 0.25), "with snapping off the move is free (%s)" % a.global_position)
+	ed.snap_on = true
+	ed.pointer = ed.Pointer.SELECT
+	a.global_position = Vector3(-3, 0, 0)
+
+
+func _popovers() -> void:
+	var before: int = ed.sel_objects.size()
+	var p := _row_center(ed.toggle_list, 0)
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.popover.visible and ed.popover_kind == "SNAP", "a finger tap on SNAP opens the snap menu")
+	var empty := Vector2(ed.view_rect.end.x - 20, ed.view_rect.end.y - 20)
+	_finger(0, empty, true)
+	_finger(0, empty, false)
+	await _settle()
+	ok(not ed.popover.visible, "a tap outside closes it")
+	ok(ed.sel_objects.size() == before, "and that tap does nothing else")
+	_pen_tap(p)
+	await _settle()
+	var row: Vector2 = ed.snap_menu.global_position + ed.snap_menu.row_rect(ed.snap_menu.index_of("SNAP")).get_center()
+	_pen_tap(row)
+	ok(not ed.snap_on, "the SNAP row turns snapping off")
+	_pen_tap(row)
+	ok(ed.snap_on, "and on again")
+	var step: Vector2 = ed.snap_menu.global_position + ed.snap_menu.row_rect(ed.snap_menu.index_of("STEP")).get_center()
+	_pen_tap(step)
+	ok(is_equal_approx(ed.snap_step, 0.1), "STEP steps 0.25 to 0.1")
+	for i in 3:
+		_pen_tap(step)
+	ok(is_equal_approx(ed.snap_step, 0.25), "and round again to 0.25")
+	var vert: Vector2 = ed.snap_menu.global_position + ed.snap_menu.row_rect(ed.snap_menu.index_of("VERTEX")).get_center()
+	_pen_tap(vert)
+	ok(ed.snap_targets.VERTEX, "VERTEX is a target now")
+	_pen_tap(vert)
+	ok(ed.popover.visible, "the menu stays open while its rows are tapped")
+	# Shading.
+	p = _row_center(ed.toggle_list, 1)
+	_pen_tap(p)
+	await _settle()
+	ok(ed.popover.visible and ed.matcap_grid.visible, "SHADING opens the matcap gallery")
+	ok(Matcaps.count() == 16, "sixteen matcaps")
+	var cell: Vector2 = ed.matcap_grid.global_position + ed.matcap_grid.cell_rect(5).get_center()
+	_pen_tap(cell)
+	ok(SceneObject.matcap_index == 5, "a tap on the sixth cell picks it")
+	ok(SceneObject.material().get_shader_parameter("matcap") == Matcaps.texture(5), "and the shared material wears it")
+	_pen_tap(p)
+	await _settle()
+	ok(not ed.popover.visible, "tapping SHADING again closes it")
+	SceneObject.set_matcap(0)
+
+
+func _groups() -> void:
+	ed.set_mode(ed.Mode.OBJECT)
+	var a: Node3D = ed.objects()[0]
+	var c: Node3D = ed.add_primitive("CUBE")
+	a.global_position = Vector3(-2, 0, 0)
+	c.global_position = Vector3(2, 0, 0)
+	ed.select_object(a)
+	ed.select_object(c, true)
+	var g: Node3D = ed.add_group()
+	await _settle()
+	ok(g.is_group and g.child_objects().size() == 2, "GROUP with two selected wraps both")
+	ok(g.global_position.is_equal_approx(Vector3.ZERO), "at their centre (%s)" % g.global_position)
+	ok(a.global_position.is_equal_approx(Vector3(-2, 0, 0)), "and they stay where they were")
+	ok(ed.active_object == g and ed.mode == ed.Mode.OBJECT, "the group is active, in OBJECT mode")
+	ok(ed.mode_list.items[1].disabled, "EDIT is disabled for a group")
+	ed.set_mode(ed.Mode.EDIT)
+	ok(ed.mode == ed.Mode.OBJECT, "and cannot be entered")
+	var rows: Array = ed.hierarchy.items
+	ok(rows[0].icon == &"group" and rows[0].depth == 0, "the group row carries the group glyph at the root")
+	ok(rows[1].depth == 1 and not rows[1].last and rows[1].tree == [false], "its first child continues the line")
+	ok(rows[2].depth == 2 and rows[2].tree == [false, true], "a grandchild carries its parent's line past it")
+	ed.clear_object_selection()
+	var s: Node3D = ed.objects()[2]
+	s.global_position = Vector3(0, 3, 0)
+	var p := _screen(g.global_position)
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.active_object == g, "a finger tap on the group's axes picks it")
+	ed.clear_object_selection()
+	var e: Node3D = ed.add_group()
+	ok(e.get_parent() == ed.world_root and e.child_objects().is_empty(), "GROUP with nothing selected is an empty group at the root")
 
 
 func _fingers() -> void:

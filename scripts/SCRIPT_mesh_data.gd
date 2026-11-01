@@ -206,7 +206,9 @@ func faces_using_vert(v: int) -> Array[int]:
 
 ## Flat-shaded triangle mesh. Vertices are split per face so every face has
 ## its own normal; that is the clay look, and it is also what makes face
-## selection readable later.
+## selection readable later. Faces here wind counter-clockwise seen from
+## outside (the right-hand rule gives the outward normal); Godot's front
+## faces wind CLOCKWISE, so each triangle is emitted reversed.
 func build_mesh() -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	if faces.is_empty():
@@ -216,7 +218,7 @@ func build_mesh() -> ArrayMesh:
 	for f in faces.size():
 		var n := face_normal(f)
 		for tri in face_triangles(f):
-			for i in tri:
+			for i in [tri[0], tri[2], tri[1]]:
 				pos.append(verts[i])
 				nrm.append(n)
 	var arrays := []

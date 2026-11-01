@@ -1,7 +1,7 @@
 extends Node3D
-## The editor. One screen: the hierarchy down the left, the mode bar across
-## the top, the 3D view under both. Chunk one: objects, primitives, the three
-## element modes, select and move, drag-to-parent in the hierarchy.
+## The editor. One screen: the mode bar across the top, the hierarchy down
+## the right, the 3D view under both. Objects, groups, primitives, the three
+## element modes, select and move, snapping, matcaps.
 ##
 ## Two pointers, told apart by event class:
 ##   fingers  InputEventScreenTouch/Drag   camera (1 orbits, 2 pan + pinch),
@@ -14,19 +14,23 @@ const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
 const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
 const Rows := preload("res://scripts/SCRIPT_row_list.gd")
 const Overlay := preload("res://scripts/SCRIPT_viewport_overlay.gd")
+const Grid := preload("res://scripts/SCRIPT_matcap_grid.gd")
 
 enum Mode { OBJECT, EDIT }
 enum Elem { VERT, EDGE, FACE }
 enum Pointer { SELECT, MOVE, TOOL }
 
-const LEFT_W := 260.0
-const TOP_H := T.ROW_H + 16.0
-const PEN_RADIUS := 14.0
-const FINGER_RADIUS := 28.0
-const TAP_SLOP := 12.0
+const RIGHT_W := 250.0
+const BAR_H := T.ROW_H + 12.0
+const PEN_RADIUS := 12.0
+const FINGER_RADIUS := 24.0
+const SNAP_RADIUS := 22.0
+const TAP_SLOP := 10.0
 const TAP_TIME := 0.35
+const POPOVER_W := 272.0
 
 const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
+const STEPS := [1.0, 0.5, 0.25, 0.1]
 
 # --- state -------------------------------------------------------------------
 
@@ -52,20 +56,33 @@ var _box_to := Vector2.ZERO
 
 var view_rect := Rect2()
 
+# Snapping. On by default: moves land on the grid unless you turn it off.
+var snap_on := true
+var snap_targets: Dictionary = {"INCREMENT": true, "VERTEX": false, "EDGE": false, "FACE": false}
+var snap_step := 0.25
+var snap_absolute := true     # positions land ON the grid, not just in steps of it
+var snap_self := false        # in EDIT, the object's own unselected elements count
+var snap_hit: Dictionary = {} # {point, kind} while a move is held to a target
+
 # --- nodes -------------------------------------------------------------------
 
 @onready var world_root: Node3D = $Scene
 @onready var orbit: OrbitCamera = $OrbitCamera
 @onready var ui: CanvasLayer = $UI
 
-var left_panel: ChamferPanel
+var right_panel: ChamferPanel
 var top_panel: ChamferPanel
 var hierarchy: RowList
 var add_list: RowList
 var mode_list: RowList
 var elem_list: RowList
 var pointer_list: RowList
+var toggle_list: RowList
 var overlay: ViewportOverlay
+var popover: ChamferPanel
+var popover_kind := ""
+var snap_menu: RowList
+var matcap_grid: MatcapGrid
 var _headings: Array[Label] = []
 
 # --- gesture bookkeeping -----------------------------------------------------
@@ -81,8 +98,10 @@ var _pen_moving := false
 var _middle_down := false
 var _move_plane := Plane()
 var _move_start := Vector3.ZERO
+var _move_pivot := Vector3.ZERO
 var _move_obj_start: Dictionary = {}    # SceneObject -> global_position
 var _move_vert_start := PackedVector3Array()
+var _moving_set: Dictionary = {}        # objects a snap must not target
 
 
 func _ready() -> void:
@@ -104,15 +123,9 @@ func _build_world() -> void:
 	env.environment = Environment.new()
 	env.environment.background_mode = Environment.BG_COLOR
 	env.environment.background_color = T.WORLD_BG
-	env.environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.environment.ambient_light_color = Color(1, 1, 1)
-	env.environment.ambient_light_energy = 0.35
 	add_child(env)
-	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-50, -30, 0)
-	sun.light_energy = 1.1
-	add_child(sun)
 	add_child(_grid())
+	SceneObject.material()
 
 
 func _grid() -> MeshInstance3D:
@@ -140,13 +153,17 @@ func _build_ui() -> void:
 	overlay.editor = self
 	ui.add_child(overlay)
 
-	left_panel = Chamfer.new()
-	ui.add_child(left_panel)
+	right_panel = Chamfer.new()
+	right_panel.cut_top_left = true
+	right_panel.cut_top_right = false
+	right_panel.cut_bottom_left = false
+	right_panel.cut_bottom_right = true
+	ui.add_child(right_panel)
 	top_panel = Chamfer.new()
 	top_panel.cut_size = T.ROW_CUT
 	ui.add_child(top_panel)
 
-	_headings.append(_heading("OBJECTS"))
+	_headings.append(_heading("HIERARCHY"))
 	hierarchy = Rows.new()
 	hierarchy.draggable = true
 	hierarchy.tapped.connect(_on_hierarchy_tapped)
@@ -157,31 +174,49 @@ func _build_ui() -> void:
 	add_list = Rows.new()
 	var adds: Array[Dictionary] = []
 	for p in PRIMITIVES:
-		adds.append({"id": p, "text": p})
-	adds.append({"id": "DELETE", "text": "DELETE"})
+		adds.append({"id": p, "text": p, "icon": StringName(p.to_lower())})
+	adds.append({"id": "GROUP", "text": "GROUP", "icon": &"group"})
+	adds.append({"id": "DELETE", "text": "DELETE", "icon": &"delete"})
 	add_list.set_items(adds)
 	add_list.tapped.connect(_on_add_tapped)
 	ui.add_child(add_list)
 
-	mode_list = Rows.new()
-	mode_list.horizontal = true
-	mode_list.set_items([{"id": "OBJECT", "text": "OBJECT"}, {"id": "EDIT", "text": "EDIT"}])
-	mode_list.tapped.connect(_on_mode_tapped)
-	ui.add_child(mode_list)
+	mode_list = _bar([{"id": "OBJECT", "text": "OBJECT", "icon": &"object"},
+			{"id": "EDIT", "text": "EDIT", "icon": &"edit"}], _on_mode_tapped)
+	elem_list = _bar([{"id": "VERT", "text": "VERT", "icon": &"vert"},
+			{"id": "EDGE", "text": "EDGE", "icon": &"edge"},
+			{"id": "FACE", "text": "FACE", "icon": &"face"}], _on_elem_tapped)
+	pointer_list = _bar([{"id": "SELECT", "text": "SELECT", "icon": &"select"},
+			{"id": "MOVE", "text": "MOVE", "icon": &"move"},
+			{"id": "TOOL", "text": "TOOL", "icon": &"tool", "disabled": true}], _on_pointer_tapped)
+	toggle_list = _bar([{"id": "SNAP", "text": "SNAP", "icon": &"snap", "lit": true},
+			{"id": "SHADING", "text": "SHADING", "icon": &"shading"}], _on_toggle_tapped)
 
-	elem_list = Rows.new()
-	elem_list.horizontal = true
-	elem_list.set_items([{"id": "VERT", "text": "VERT"}, {"id": "EDGE", "text": "EDGE"},
-			{"id": "FACE", "text": "FACE"}])
-	elem_list.tapped.connect(_on_elem_tapped)
-	ui.add_child(elem_list)
+	# The popover: one frame that holds the snap menu or the matcap gallery.
+	popover = Chamfer.new()
+	popover.cut_size = T.ROW_CUT
+	popover.cut_top_right = false
+	popover.cut_bottom_right = true
+	popover.visible = false
+	ui.add_child(popover)
+	snap_menu = Rows.new()
+	snap_menu.tapped.connect(_on_snap_tapped)
+	snap_menu.position = Vector2(4.0, 8.0)
+	snap_menu.visible = false
+	ui.add_child(snap_menu)
+	matcap_grid = Grid.new()
+	matcap_grid.picked.connect(_on_matcap_picked)
+	matcap_grid.visible = false
+	ui.add_child(matcap_grid)
 
-	pointer_list = Rows.new()
-	pointer_list.horizontal = true
-	pointer_list.set_items([{"id": "SELECT", "text": "SELECT"}, {"id": "MOVE", "text": "MOVE"},
-			{"id": "TOOL", "text": "TOOL", "disabled": true}])
-	pointer_list.tapped.connect(_on_pointer_tapped)
-	ui.add_child(pointer_list)
+
+func _bar(items: Array[Dictionary], handler: Callable) -> RowList:
+	var l := Rows.new()
+	l.horizontal = true
+	l.set_items(items)
+	l.tapped.connect(handler)
+	ui.add_child(l)
+	return l
 
 
 func _heading(text: String) -> Label:
@@ -199,37 +234,39 @@ func _layout() -> void:
 	var s := get_viewport().get_visible_rect().size
 	var m := float(T.MARGIN)
 	var pad := float(T.PAD)
-	# Left column.
-	left_panel.position = Vector2(m, m)
-	left_panel.size = Vector2(LEFT_W, s.y - m * 2.0)
-	var add_rows := add_list.items.size()
-	var add_h := add_rows * T.ROW_H
-	var add_head_y := s.y - m - pad - add_h - T.FS_LABEL - 8.0
-	_headings[1].position = Vector2(m + pad, add_head_y)
-	add_list.position = Vector2(m + 4.0, add_head_y + T.FS_LABEL + 8.0)
-	add_list.size = Vector2(LEFT_W - 8.0, add_h)
-	_headings[0].position = Vector2(m + pad, m + 12.0)
-	hierarchy.position = Vector2(m + 4.0, m + 12.0 + T.FS_LABEL + 8.0)
-	hierarchy.size = Vector2(LEFT_W - 8.0, add_head_y - 12.0 - hierarchy.position.y)
-	# Top bar.
-	var tx := m + LEFT_W + T.GUTTER
-	top_panel.position = Vector2(tx, m)
-	top_panel.size = Vector2(s.x - tx - m, TOP_H)
-	var ry := m + 8.0
-	mode_list.position = Vector2(tx + 8.0, ry)
-	mode_list.size = Vector2(mode_list.row_rect(1).end.x, T.ROW_H)
-	elem_list.position = Vector2(mode_list.position.x + mode_list.size.x + T.GUTTER, ry)
-	elem_list.size = Vector2(elem_list.row_rect(2).end.x, T.ROW_H)
-	pointer_list.size = Vector2(pointer_list.row_rect(2).end.x, T.ROW_H)
-	pointer_list.position = Vector2(s.x - m - 8.0 - pointer_list.size.x, ry)
+	# Right column.
+	var rx := s.x - m - RIGHT_W
+	right_panel.position = Vector2(rx, m)
+	right_panel.size = Vector2(RIGHT_W, s.y - m * 2.0)
+	var add_h := add_list.items.size() * T.ROW_H
+	var add_head_y := s.y - m - pad - add_h - T.FS_LABEL - 6.0
+	_headings[1].position = Vector2(rx + pad, add_head_y)
+	add_list.position = Vector2(rx + 4.0, add_head_y + T.FS_LABEL + 6.0)
+	add_list.size = Vector2(RIGHT_W - 8.0, add_h)
+	_headings[0].position = Vector2(rx + pad, m + 10.0)
+	hierarchy.position = Vector2(rx + 4.0, m + 10.0 + T.FS_LABEL + 6.0)
+	hierarchy.size = Vector2(RIGHT_W - 8.0, add_head_y - 10.0 - hierarchy.position.y)
+	# Top bar, left of the column.
+	top_panel.position = Vector2(m, m)
+	top_panel.size = Vector2(rx - T.GUTTER - m, BAR_H)
+	var ry := m + 6.0
+	var x := m + 6.0
+	for l in [mode_list, elem_list, pointer_list]:
+		l.position = Vector2(x, ry)
+		l.size = l.content_size()
+		x += l.size.x + T.GUTTER
+	toggle_list.size = toggle_list.content_size()
+	toggle_list.position = Vector2(top_panel.position.x + top_panel.size.x - 6.0 - toggle_list.size.x, ry)
 	# What is left is the view.
-	view_rect = Rect2(tx, m + TOP_H + T.GUTTER, s.x - tx - m, s.y - (m + TOP_H + T.GUTTER) - m)
+	var top := m + BAR_H + T.GUTTER
+	view_rect = Rect2(m, top, rx - T.GUTTER - m, s.y - top - m)
+	_place_popover()
 
 
 func _refresh_lists() -> void:
-	# Hierarchy, depth-first, in tree order.
+	# Hierarchy, depth-first, in tree order, with the tree lines worked out.
 	var items: Array[Dictionary] = []
-	_walk(world_root, 0, items)
+	_walk(world_root, [], items)
 	hierarchy.set_items(items)
 	var sel := {}
 	for o in sel_objects:
@@ -238,23 +275,35 @@ func _refresh_lists() -> void:
 	hierarchy.set_active(active_object.get_instance_id() if active_object != null else null)
 	# Mode bar.
 	mode_list.set_active("OBJECT" if mode == Mode.OBJECT else "EDIT")
-	mode_list.items[1].disabled = active_object == null
+	mode_list.items[1].disabled = active_object == null or not active_object.has_mesh()
 	for it in elem_list.items:
 		it.disabled = mode == Mode.OBJECT
 	elem_list.set_active(["VERT", "EDGE", "FACE"][elem] if mode == Mode.EDIT else null)
 	pointer_list.set_active(["SELECT", "MOVE", "TOOL"][pointer])
+	toggle_list.items[0].lit = snap_on
+	toggle_list.set_active(popover_kind if popover.visible else null)
 	add_list.items[add_list.items.size() - 1].disabled = sel_objects.is_empty() \
 			if mode == Mode.OBJECT else sel_verts.is_empty()
 	add_list.queue_redraw()
 	mode_list.queue_redraw()
 	elem_list.queue_redraw()
+	toggle_list.queue_redraw()
+	_refresh_snap_menu()
 
 
-func _walk(n: Node, depth: int, out: Array[Dictionary]) -> void:
+func _walk(n: Node, trail: Array, out: Array[Dictionary]) -> void:
+	var kids: Array[SceneObject] = []
 	for c in n.get_children():
 		if c is SceneObject:
-			out.append({"id": c.get_instance_id(), "text": c.name, "depth": depth})
-			_walk(c, depth + 1, out)
+			kids.append(c)
+	for i in kids.size():
+		var c := kids[i]
+		var last := i == kids.size() - 1
+		out.append({"id": c.get_instance_id(), "text": c.name, "depth": trail.size(),
+				"icon": &"group" if c.is_group else &"mesh", "tree": trail.duplicate(), "last": last})
+		var t := trail.duplicate()
+		t.append(not last)
+		_walk(c, t, out)
 
 
 func objects() -> Array[SceneObject]:
@@ -274,18 +323,110 @@ func status_words() -> String:
 	var words: String = "OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem]
 	if active_object != null:
 		words += "    " + active_object.name
+	if snap_on:
+		var on: Array = []
+		for k in snap_targets:
+			if snap_targets[k]:
+				on.append(k)
+		words += "    SNAP " + " ".join(on)
 	return words
 
 
 func status_counts() -> Array:
 	if active_object == null:
 		return [["OBJECTS", objects().size()]]
+	if active_object.is_group:
+		return [["CHILDREN", active_object.child_objects().size()]]
 	var d := active_object.data
 	if mode == Mode.EDIT:
 		return [["V", "%02d/%02d" % [sel_verts.size(), d.vert_count()]],
 				["E", "%02d/%02d" % [sel_edges.size(), d.edge_count()]],
 				["F", "%02d/%02d" % [sel_faces.size(), d.face_count()]]]
 	return [["V", d.vert_count()], ["E", d.edge_count()], ["F", d.face_count()]]
+
+
+# --- popovers ------------------------------------------------------------------
+
+func open_popover(kind: String) -> void:
+	if popover.visible and popover_kind == kind:
+		close_popover()
+		return
+	popover_kind = kind
+	popover.visible = true
+	snap_menu.visible = kind == "SNAP"
+	matcap_grid.visible = kind == "SHADING"
+	_refresh_snap_menu()
+	matcap_grid.set_active(SceneObject.matcap_index)
+	_place_popover()
+	_refresh_lists()
+
+
+func close_popover() -> void:
+	if not popover.visible:
+		return
+	popover.visible = false
+	snap_menu.visible = false
+	matcap_grid.visible = false
+	_refresh_lists()
+
+
+func _place_popover() -> void:
+	if not popover.visible:
+		return
+	var i := toggle_list.index_of(popover_kind)
+	var anchor := toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
+	var top := view_rect.position.y - 2.0
+	if popover_kind == "SNAP":
+		snap_menu.size = Vector2(POPOVER_W - 8.0, 0.0)
+		var h: float = snap_menu.content_size().y
+		popover.size = Vector2(POPOVER_W, h + 16.0)
+		popover.position = Vector2(minf(anchor.x, view_rect.end.x - POPOVER_W), top)
+		snap_menu.position = popover.position + Vector2(4.0, 8.0)
+		snap_menu.size = Vector2(POPOVER_W - 8.0, h)
+	else:
+		var g := MatcapGrid.grid_size()
+		popover.size = g + Vector2(T.PAD * 2, T.PAD * 2)
+		popover.position = Vector2(minf(anchor.x, view_rect.end.x - popover.size.x), top)
+		matcap_grid.position = popover.position + Vector2(T.PAD, T.PAD)
+
+
+func _refresh_snap_menu() -> void:
+	var rows: Array[Dictionary] = [
+		{"id": "SNAP", "text": "SNAP", "icon": &"snap", "on": snap_on},
+		{"id": "_t", "text": "TARGET", "heading": true},
+		{"id": "INCREMENT", "text": "INCREMENT", "on": snap_targets.INCREMENT, "disabled": not snap_on},
+		{"id": "VERTEX", "text": "VERTEX", "icon": &"vert", "on": snap_targets.VERTEX, "disabled": not snap_on},
+		{"id": "EDGE", "text": "EDGE", "icon": &"edge", "on": snap_targets.EDGE, "disabled": not snap_on},
+		{"id": "FACE", "text": "FACE", "icon": &"face", "on": snap_targets.FACE, "disabled": not snap_on},
+		{"id": "_i", "text": "INCREMENT", "heading": true},
+		{"id": "STEP", "text": "STEP", "value": "%.2f" % snap_step, "value_clock": true,
+				"disabled": not (snap_on and snap_targets.INCREMENT)},
+		{"id": "ABSOLUTE", "text": "ABSOLUTE GRID", "on": snap_absolute,
+				"disabled": not (snap_on and snap_targets.INCREMENT)},
+		{"id": "_o", "text": "OPTIONS", "heading": true},
+		{"id": "SELF", "text": "SNAP TO SELF", "on": snap_self, "disabled": not snap_on},
+	]
+	snap_menu.set_items(rows)
+
+
+func _on_snap_tapped(id: Variant) -> void:
+	match id:
+		"SNAP": snap_on = not snap_on
+		"INCREMENT", "VERTEX", "EDGE", "FACE": snap_targets[id] = not snap_targets[id]
+		"STEP": snap_step = STEPS[(STEPS.find(snap_step) + 1) % STEPS.size()]
+		"ABSOLUTE": snap_absolute = not snap_absolute
+		"SELF": snap_self = not snap_self
+	_refresh_lists()
+	_place_popover()
+
+
+func _on_matcap_picked(i: int) -> void:
+	SceneObject.set_matcap(i)
+	matcap_grid.set_active(i)
+
+
+func _on_toggle_tapped(id: Variant) -> void:
+	open_popover(id)
 
 
 # --- rows ----------------------------------------------------------------------
@@ -310,10 +451,10 @@ func _on_hierarchy_dropped(from_id: Variant, to_id: Variant) -> void:
 
 
 func _on_add_tapped(id: Variant) -> void:
-	if id == "DELETE":
-		delete_selected()
-	else:
-		add_primitive(id)
+	match id:
+		"DELETE": delete_selected()
+		"GROUP": add_group()
+		_: add_primitive(id)
 
 
 func _on_mode_tapped(id: Variant) -> void:
@@ -344,6 +485,30 @@ func add_primitive(kind: String) -> SceneObject:
 	mode = Mode.OBJECT
 	select_object(o)
 	return o
+
+
+## A group. With objects selected it wraps them: the group sits at their
+## centre and they become its children, keeping their place in the world.
+## With nothing selected it is an empty group at the origin.
+func add_group() -> SceneObject:
+	var g := SceneObject.create_group(_unique_name("Group"))
+	var roots := _move_roots() if mode == Mode.OBJECT else []
+	if roots.is_empty():
+		world_root.add_child(g)
+	else:
+		var centre := Vector3.ZERO
+		for o in roots:
+			centre += o.global_position
+		centre /= float(roots.size())
+		# The group goes where the first root was, so a group of children of
+		# a group stays inside that group.
+		roots[0].get_parent().add_child(g)
+		g.global_position = centre
+		for o in roots:
+			o.reparent(g, true)
+	mode = Mode.OBJECT
+	select_object(g)
+	return g
 
 
 func _unique_name(base: String) -> String:
@@ -378,7 +543,7 @@ func select_object(o: SceneObject, add := false) -> void:
 	if active_object != o:
 		_clear_elems()
 	active_object = o
-	if o == null and mode == Mode.EDIT:
+	if mode == Mode.EDIT and (o == null or not o.has_mesh()):
 		mode = Mode.OBJECT
 	_refresh_lists()
 
@@ -393,7 +558,7 @@ func clear_object_selection() -> void:
 
 
 func set_mode(m: Mode) -> void:
-	if m == Mode.EDIT and active_object == null:
+	if m == Mode.EDIT and (active_object == null or not active_object.has_mesh()):
 		return
 	mode = m
 	hover_kind = -1
@@ -463,8 +628,6 @@ func select_edges(es: Dictionary) -> void:
 		vs[d.edges[e].x] = true
 		vs[d.edges[e].y] = true
 	select_verts(vs)
-	# A vertex set can imply faces nobody picked (all four corners of a quad via
-	# its four edges is that quad, which is right; two verts never are).
 	sel_edges = es.duplicate()
 	_refresh_lists()
 
@@ -485,11 +648,6 @@ func select_faces(fs: Dictionary) -> void:
 	_refresh_lists()
 
 
-## Every vertex the current selection moves.
-func moving_verts() -> Dictionary:
-	return sel_verts
-
-
 # --- picking -------------------------------------------------------------------
 
 func _ray(pos: Vector2) -> Array:
@@ -497,11 +655,15 @@ func _ray(pos: Vector2) -> Array:
 	return [cam.project_ray_origin(pos), cam.project_ray_normal(pos)]
 
 
-func pick_object(pos: Vector2) -> SceneObject:
+## The object under `pos`: the nearest mesh the ray hits, or failing that a
+## group whose origin marker is within `radius`.
+func pick_object(pos: Vector2, radius: float = PEN_RADIUS) -> SceneObject:
 	var r := _ray(pos)
 	var best: SceneObject = null
 	var best_t := INF
 	for o in objects():
+		if o.is_group:
+			continue
 		var inv := o.global_transform.affine_inverse()
 		var lo: Vector3 = inv * r[0]
 		var ld: Vector3 = (inv.basis * r[1]).normalized()
@@ -512,6 +674,17 @@ func pick_object(pos: Vector2) -> SceneObject:
 		var t: float = (wp - r[0]).length()
 		if t < best_t:
 			best_t = t
+			best = o
+	if best != null:
+		return best
+	var cam := camera()
+	var best_d := radius
+	for o in objects():
+		if not o.is_group or cam.is_position_behind(o.global_position):
+			continue
+		var d := cam.unproject_position(o.global_position).distance_to(pos)
+		if d < best_d:
+			best_d = d
 			best = o
 	return best
 
@@ -571,7 +744,7 @@ func tap(pos: Vector2, radius: float) -> void:
 	if not view_rect.has_point(pos):
 		return
 	if mode == Mode.OBJECT:
-		var o := pick_object(pos)
+		var o := pick_object(pos, radius)
 		if o == null:
 			clear_object_selection()
 		else:
@@ -640,7 +813,7 @@ func update_hover(pos: Vector2, radius: float) -> void:
 	if not view_rect.has_point(pos):
 		return
 	if mode == Mode.OBJECT:
-		hover_object = pick_object(pos)
+		hover_object = pick_object(pos, radius)
 	elif active_object != null:
 		hover_index = pick_elem(pos, radius)
 		hover_kind = elem if hover_index >= 0 else -1
@@ -671,19 +844,27 @@ func _move_roots() -> Array[SceneObject]:
 func move_begin(pos: Vector2) -> void:
 	var pivot := Vector3.ZERO
 	_move_obj_start.clear()
+	_moving_set.clear()
 	if mode == Mode.OBJECT:
 		var roots := _move_roots()
 		for o in roots:
 			_move_obj_start[o] = o.global_position
 			pivot += o.global_position
 		pivot /= float(maxi(roots.size(), 1))
+		for o in objects():
+			for r in roots:
+				if o == r or o.is_descendant_of(r):
+					_moving_set[o] = true
 	else:
 		_move_vert_start = active_object.data.verts.duplicate()
 		for i in sel_verts:
 			pivot += active_object.global_transform * _move_vert_start[i]
 		pivot /= float(maxi(sel_verts.size(), 1))
+		_moving_set[active_object] = true
+	_move_pivot = pivot
 	_move_plane = Plane(camera().global_basis.z, pivot)
 	_move_start = _plane_point(pos, pivot)
+	snap_hit = {}
 
 
 func _plane_point(pos: Vector2, fallback: Vector3) -> Vector3:
@@ -692,8 +873,91 @@ func _plane_point(pos: Vector2, fallback: Vector3) -> Vector3:
 	return p if p != null else fallback
 
 
+## Where the pivot goes for a pointer at `pos`, with snapping applied: a
+## vertex, edge or face under the pointer wins; otherwise the free position,
+## held to the grid when INCREMENT is on.
+func move_target(pos: Vector2) -> Vector3:
+	snap_hit = {}
+	if snap_on and (snap_targets.VERTEX or snap_targets.EDGE or snap_targets.FACE):
+		var hit := snap_target(pos)
+		if not hit.is_empty():
+			snap_hit = hit
+			return hit.point
+	var free: Vector3 = _move_pivot + (_plane_point(pos, _move_start) - _move_start)
+	if snap_on and snap_targets.INCREMENT:
+		if snap_absolute:
+			return free.snapped(Vector3.ONE * snap_step)
+		return _move_pivot + (free - _move_pivot).snapped(Vector3.ONE * snap_step)
+	return free
+
+
+## The nearest snappable thing to `pos` within SNAP_RADIUS, on anything that
+## is not being moved: {point, kind} or {}. Vertices beat edges beat faces.
+func snap_target(pos: Vector2) -> Dictionary:
+	var cam := camera()
+	var r := _ray(pos)
+	var best := {}
+	var best_rank := 9
+	var best_d := INF
+	for o in objects():
+		if o.is_group:
+			continue
+		var own: bool = _moving_set.has(o)
+		if own and not (mode == Mode.EDIT and snap_self and o == active_object):
+			continue
+		var xf := o.global_transform
+		var d := o.data
+		if snap_targets.VERTEX:
+			for i in d.verts.size():
+				if own and sel_verts.has(i):
+					continue
+				var w := xf * d.verts[i]
+				if cam.is_position_behind(w):
+					continue
+				var dist := cam.unproject_position(w).distance_to(pos)
+				if dist <= SNAP_RADIUS and (best_rank > 0 or dist < best_d):
+					best = {"point": w, "kind": "VERTEX"}
+					best_rank = 0
+					best_d = dist
+		if snap_targets.EDGE and best_rank > 0:
+			for e in d.edges:
+				if own and (sel_verts.has(e.x) or sel_verts.has(e.y)):
+					continue
+				var a := xf * d.verts[e.x]
+				var b := xf * d.verts[e.y]
+				if cam.is_position_behind(a) or cam.is_position_behind(b):
+					continue
+				var sa := cam.unproject_position(a)
+				var sb := cam.unproject_position(b)
+				var p := Geometry2D.get_closest_point_to_segment(pos, sa, sb)
+				var dist := p.distance_to(pos)
+				if dist <= SNAP_RADIUS and (best_rank > 1 or dist < best_d):
+					var t := 0.0 if sa.is_equal_approx(sb) else (p - sa).length() / (sb - sa).length()
+					best = {"point": a.lerp(b, t), "kind": "EDGE"}
+					best_rank = 1
+					best_d = dist
+		if snap_targets.FACE and best_rank > 1:
+			var inv := xf.affine_inverse()
+			var hit := d.ray_hit(inv * r[0], (inv.basis * r[1]).normalized())
+			if not hit.is_empty() and not (own and _face_moving(d, hit.face)):
+				var w: Vector3 = xf * hit.point
+				var dist: float = (w - r[0]).length()
+				if best_rank > 2 or dist < best_d:
+					best = {"point": w, "kind": "FACE"}
+					best_rank = 2
+					best_d = dist
+	return best
+
+
+func _face_moving(d: MeshData, f: int) -> bool:
+	for i in d.faces[f]:
+		if sel_verts.has(i):
+			return true
+	return false
+
+
 func move_update(pos: Vector2) -> void:
-	var delta := _plane_point(pos, _move_start) - _move_start
+	var delta := move_target(pos) - _move_pivot
 	if mode == Mode.OBJECT:
 		for o in _move_obj_start:
 			if is_instance_valid(o):
@@ -708,13 +972,16 @@ func move_update(pos: Vector2) -> void:
 
 func move_end() -> void:
 	_move_obj_start.clear()
+	_moving_set.clear()
+	snap_hit = {}
 
 
 # --- input ---------------------------------------------------------------------
 # A gesture that began in the view keeps its pointer until it lifts, even when
 # it crosses a panel: those continuations are taken in `_input`, ahead of the
-# GUI. Everything else (presses, hover, the wheel) is whatever the panels did
-# not take, in `_unhandled_input`.
+# GUI. A press anywhere outside an open popover closes it and goes no further.
+# Everything else (presses, hover, the wheel) is whatever the panels did not
+# take, in `_unhandled_input`.
 
 func _input(event: InputEvent) -> void:
 	var touch := event as InputEventScreenTouch
@@ -722,6 +989,17 @@ func _input(event: InputEvent) -> void:
 	var click := event as InputEventMouseButton
 	var motion := event as InputEventMouseMotion
 	var mine := false
+	if popover.visible:
+		var press_pos: Variant = null
+		if touch != null and touch.pressed:
+			press_pos = touch.position
+		elif click != null and click.pressed and click.button_index == MOUSE_BUTTON_LEFT:
+			press_pos = click.position
+		if press_pos != null and not popover.get_rect().has_point(press_pos) \
+				and not toggle_list.get_rect().has_point(press_pos):
+			close_popover()
+			get_viewport().set_input_as_handled()
+			return
 	if touch != null and not touch.pressed and _touches.has(touch.index):
 		_touch(touch)
 		mine = true
