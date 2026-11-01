@@ -1,0 +1,890 @@
+extends Node3D
+## The editor. One screen: the hierarchy down the left, the mode bar across
+## the top, the 3D view under both. Chunk one: objects, primitives, the three
+## element modes, select and move, drag-to-parent in the hierarchy.
+##
+## Two pointers, told apart by event class:
+##   fingers  InputEventScreenTouch/Drag   camera (1 orbits, 2 pan + pinch),
+##                                         taps select, drags move in MOVE
+##   pen      InputEventMouse*             picks, hovers, box-selects, moves;
+##                                         never moves the camera
+## A desktop mouse is a pen. Middle-drag orbits and the wheel zooms, for a desk.
+
+const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
+const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
+const Rows := preload("res://scripts/SCRIPT_row_list.gd")
+const Overlay := preload("res://scripts/SCRIPT_viewport_overlay.gd")
+
+enum Mode { OBJECT, EDIT }
+enum Elem { VERT, EDGE, FACE }
+enum Pointer { SELECT, MOVE, TOOL }
+
+const LEFT_W := 260.0
+const TOP_H := T.ROW_H + 16.0
+const PEN_RADIUS := 14.0
+const FINGER_RADIUS := 28.0
+const TAP_SLOP := 12.0
+const TAP_TIME := 0.35
+
+const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
+
+# --- state -------------------------------------------------------------------
+
+var mode: Mode = Mode.OBJECT
+var elem: Elem = Elem.VERT
+var pointer: Pointer = Pointer.SELECT
+
+var sel_objects: Array[SceneObject] = []
+var active_object: SceneObject = null
+var sel_verts: Dictionary = {}
+var sel_edges: Dictionary = {}
+var sel_faces: Dictionary = {}
+
+var hover_object: SceneObject = null
+var hover_kind: int = -1
+var hover_index: int = -1
+var pen_hover_valid := false
+var pen_hover_pos := Vector2.ZERO
+
+var box_active := false
+var _box_from := Vector2.ZERO
+var _box_to := Vector2.ZERO
+
+var view_rect := Rect2()
+
+# --- nodes -------------------------------------------------------------------
+
+@onready var world_root: Node3D = $Scene
+@onready var orbit: OrbitCamera = $OrbitCamera
+@onready var ui: CanvasLayer = $UI
+
+var left_panel: ChamferPanel
+var top_panel: ChamferPanel
+var hierarchy: RowList
+var add_list: RowList
+var mode_list: RowList
+var elem_list: RowList
+var pointer_list: RowList
+var overlay: ViewportOverlay
+var _headings: Array[Label] = []
+
+# --- gesture bookkeeping -----------------------------------------------------
+
+var _touches: Dictionary = {}       # index -> {pos, start, time, cancelled}
+var _pinch_center := Vector2.ZERO
+var _pinch_dist := 0.0
+var _finger_moving := false
+var _pen_down := false
+var _pen_start := Vector2.ZERO
+var _pen_dragging := false
+var _pen_moving := false
+var _middle_down := false
+var _move_plane := Plane()
+var _move_start := Vector3.ZERO
+var _move_obj_start: Dictionary = {}    # SceneObject -> global_position
+var _move_vert_start := PackedVector3Array()
+
+
+func _ready() -> void:
+	_build_world()
+	_build_ui()
+	get_viewport().size_changed.connect(_layout)
+	_layout()
+	_refresh_lists()
+
+
+func camera() -> Camera3D:
+	return orbit.camera
+
+
+# --- world ---------------------------------------------------------------------
+
+func _build_world() -> void:
+	var env := WorldEnvironment.new()
+	env.environment = Environment.new()
+	env.environment.background_mode = Environment.BG_COLOR
+	env.environment.background_color = T.WORLD_BG
+	env.environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	env.environment.ambient_light_color = Color(1, 1, 1)
+	env.environment.ambient_light_energy = 0.35
+	add_child(env)
+	var sun := DirectionalLight3D.new()
+	sun.rotation_degrees = Vector3(-50, -30, 0)
+	sun.light_energy = 1.1
+	add_child(sun)
+	add_child(_grid())
+
+
+func _grid() -> MeshInstance3D:
+	var im := ImmediateMesh.new()
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.vertex_color_use_as_albedo = true
+	im.surface_begin(Mesh.PRIMITIVE_LINES, mat)
+	for i in range(-10, 11):
+		var c := T.AXIS if i == 0 else T.GRID
+		im.surface_set_color(c)
+		im.surface_add_vertex(Vector3(i, 0, -10)); im.surface_add_vertex(Vector3(i, 0, 10))
+		im.surface_add_vertex(Vector3(-10, 0, i)); im.surface_add_vertex(Vector3(10, 0, i))
+	im.surface_end()
+	var mi := MeshInstance3D.new()
+	mi.name = "Grid"
+	mi.mesh = im
+	return mi
+
+
+# --- ui ------------------------------------------------------------------------
+
+func _build_ui() -> void:
+	overlay = Overlay.new()
+	overlay.editor = self
+	ui.add_child(overlay)
+
+	left_panel = Chamfer.new()
+	ui.add_child(left_panel)
+	top_panel = Chamfer.new()
+	top_panel.cut_size = T.ROW_CUT
+	ui.add_child(top_panel)
+
+	_headings.append(_heading("OBJECTS"))
+	hierarchy = Rows.new()
+	hierarchy.draggable = true
+	hierarchy.tapped.connect(_on_hierarchy_tapped)
+	hierarchy.drag_dropped.connect(_on_hierarchy_dropped)
+	ui.add_child(hierarchy)
+
+	_headings.append(_heading("ADD"))
+	add_list = Rows.new()
+	var adds: Array[Dictionary] = []
+	for p in PRIMITIVES:
+		adds.append({"id": p, "text": p})
+	adds.append({"id": "DELETE", "text": "DELETE"})
+	add_list.set_items(adds)
+	add_list.tapped.connect(_on_add_tapped)
+	ui.add_child(add_list)
+
+	mode_list = Rows.new()
+	mode_list.horizontal = true
+	mode_list.set_items([{"id": "OBJECT", "text": "OBJECT"}, {"id": "EDIT", "text": "EDIT"}])
+	mode_list.tapped.connect(_on_mode_tapped)
+	ui.add_child(mode_list)
+
+	elem_list = Rows.new()
+	elem_list.horizontal = true
+	elem_list.set_items([{"id": "VERT", "text": "VERT"}, {"id": "EDGE", "text": "EDGE"},
+			{"id": "FACE", "text": "FACE"}])
+	elem_list.tapped.connect(_on_elem_tapped)
+	ui.add_child(elem_list)
+
+	pointer_list = Rows.new()
+	pointer_list.horizontal = true
+	pointer_list.set_items([{"id": "SELECT", "text": "SELECT"}, {"id": "MOVE", "text": "MOVE"},
+			{"id": "TOOL", "text": "TOOL", "disabled": true}])
+	pointer_list.tapped.connect(_on_pointer_tapped)
+	ui.add_child(pointer_list)
+
+
+func _heading(text: String) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.add_theme_font_override("font", Fonts.ui())
+	l.add_theme_font_size_override("font_size", T.FS_LABEL)
+	l.add_theme_color_override("font_color", T.COL_TAG)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	ui.add_child(l)
+	return l
+
+
+func _layout() -> void:
+	var s := get_viewport().get_visible_rect().size
+	var m := float(T.MARGIN)
+	var pad := float(T.PAD)
+	# Left column.
+	left_panel.position = Vector2(m, m)
+	left_panel.size = Vector2(LEFT_W, s.y - m * 2.0)
+	var add_rows := add_list.items.size()
+	var add_h := add_rows * T.ROW_H
+	var add_head_y := s.y - m - pad - add_h - T.FS_LABEL - 8.0
+	_headings[1].position = Vector2(m + pad, add_head_y)
+	add_list.position = Vector2(m + 4.0, add_head_y + T.FS_LABEL + 8.0)
+	add_list.size = Vector2(LEFT_W - 8.0, add_h)
+	_headings[0].position = Vector2(m + pad, m + 12.0)
+	hierarchy.position = Vector2(m + 4.0, m + 12.0 + T.FS_LABEL + 8.0)
+	hierarchy.size = Vector2(LEFT_W - 8.0, add_head_y - 12.0 - hierarchy.position.y)
+	# Top bar.
+	var tx := m + LEFT_W + T.GUTTER
+	top_panel.position = Vector2(tx, m)
+	top_panel.size = Vector2(s.x - tx - m, TOP_H)
+	var ry := m + 8.0
+	mode_list.position = Vector2(tx + 8.0, ry)
+	mode_list.size = Vector2(mode_list.row_rect(1).end.x, T.ROW_H)
+	elem_list.position = Vector2(mode_list.position.x + mode_list.size.x + T.GUTTER, ry)
+	elem_list.size = Vector2(elem_list.row_rect(2).end.x, T.ROW_H)
+	pointer_list.size = Vector2(pointer_list.row_rect(2).end.x, T.ROW_H)
+	pointer_list.position = Vector2(s.x - m - 8.0 - pointer_list.size.x, ry)
+	# What is left is the view.
+	view_rect = Rect2(tx, m + TOP_H + T.GUTTER, s.x - tx - m, s.y - (m + TOP_H + T.GUTTER) - m)
+
+
+func _refresh_lists() -> void:
+	# Hierarchy, depth-first, in tree order.
+	var items: Array[Dictionary] = []
+	_walk(world_root, 0, items)
+	hierarchy.set_items(items)
+	var sel := {}
+	for o in sel_objects:
+		sel[o.get_instance_id()] = true
+	hierarchy.set_selected(sel)
+	hierarchy.set_active(active_object.get_instance_id() if active_object != null else null)
+	# Mode bar.
+	mode_list.set_active("OBJECT" if mode == Mode.OBJECT else "EDIT")
+	mode_list.items[1].disabled = active_object == null
+	for it in elem_list.items:
+		it.disabled = mode == Mode.OBJECT
+	elem_list.set_active(["VERT", "EDGE", "FACE"][elem] if mode == Mode.EDIT else null)
+	pointer_list.set_active(["SELECT", "MOVE", "TOOL"][pointer])
+	add_list.items[add_list.items.size() - 1].disabled = sel_objects.is_empty() \
+			if mode == Mode.OBJECT else sel_verts.is_empty()
+	add_list.queue_redraw()
+	mode_list.queue_redraw()
+	elem_list.queue_redraw()
+
+
+func _walk(n: Node, depth: int, out: Array[Dictionary]) -> void:
+	for c in n.get_children():
+		if c is SceneObject:
+			out.append({"id": c.get_instance_id(), "text": c.name, "depth": depth})
+			_walk(c, depth + 1, out)
+
+
+func objects() -> Array[SceneObject]:
+	var out: Array[SceneObject] = []
+	_collect(world_root, out)
+	return out
+
+
+func _collect(n: Node, out: Array[SceneObject]) -> void:
+	for c in n.get_children():
+		if c is SceneObject:
+			out.append(c)
+			_collect(c, out)
+
+
+func status_words() -> String:
+	var words: String = "OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem]
+	if active_object != null:
+		words += "    " + active_object.name
+	return words
+
+
+func status_counts() -> Array:
+	if active_object == null:
+		return [["OBJECTS", objects().size()]]
+	var d := active_object.data
+	if mode == Mode.EDIT:
+		return [["V", "%02d/%02d" % [sel_verts.size(), d.vert_count()]],
+				["E", "%02d/%02d" % [sel_edges.size(), d.edge_count()]],
+				["F", "%02d/%02d" % [sel_faces.size(), d.face_count()]]]
+	return [["V", d.vert_count()], ["E", d.edge_count()], ["F", d.face_count()]]
+
+
+# --- rows ----------------------------------------------------------------------
+
+func _on_hierarchy_tapped(id: Variant) -> void:
+	var o := instance_from_id(id) as SceneObject
+	if o == null:
+		return
+	select_object(o)
+
+
+func _on_hierarchy_dropped(from_id: Variant, to_id: Variant) -> void:
+	var o := instance_from_id(from_id) as SceneObject
+	if o == null:
+		return
+	var target: Node = world_root
+	if to_id != null:
+		target = instance_from_id(to_id) as SceneObject
+		if target == null:
+			return
+	reparent_object(o, target)
+
+
+func _on_add_tapped(id: Variant) -> void:
+	if id == "DELETE":
+		delete_selected()
+	else:
+		add_primitive(id)
+
+
+func _on_mode_tapped(id: Variant) -> void:
+	set_mode(Mode.OBJECT if id == "OBJECT" else Mode.EDIT)
+
+
+func _on_elem_tapped(id: Variant) -> void:
+	set_elem({"VERT": Elem.VERT, "EDGE": Elem.EDGE, "FACE": Elem.FACE}[id])
+
+
+func _on_pointer_tapped(id: Variant) -> void:
+	pointer = {"SELECT": Pointer.SELECT, "MOVE": Pointer.MOVE, "TOOL": Pointer.TOOL}[id]
+	_refresh_lists()
+
+
+# --- commands ------------------------------------------------------------------
+
+func add_primitive(kind: String) -> SceneObject:
+	var data: MeshData
+	match kind:
+		"PLANE": data = MeshData.make_plane()
+		"CUBE": data = MeshData.make_cube()
+		"CYLINDER": data = MeshData.make_cylinder()
+		"SPHERE": data = MeshData.make_sphere()
+		_: return null
+	var o := SceneObject.create(_unique_name(kind.capitalize()), data)
+	world_root.add_child(o)
+	mode = Mode.OBJECT
+	select_object(o)
+	return o
+
+
+func _unique_name(base: String) -> String:
+	var taken := {}
+	for o in objects():
+		taken[o.name] = true
+	if not taken.has(base):
+		return base
+	var n := 1
+	while taken.has("%s %03d" % [base, n]):
+		n += 1
+	return "%s %03d" % [base, n]
+
+
+## Parent `o` under `target` (a SceneObject or the root), keeping its place in
+## the world. Dropping an object onto its own descendant is refused.
+func reparent_object(o: SceneObject, target: Node) -> bool:
+	if target == o or (target is SceneObject and (target as SceneObject).is_descendant_of(o)):
+		return false
+	if o.get_parent() == target:
+		return false
+	o.reparent(target, true)
+	_refresh_lists()
+	return true
+
+
+func select_object(o: SceneObject, add := false) -> void:
+	if not add:
+		sel_objects.clear()
+	if o != null and not sel_objects.has(o):
+		sel_objects.append(o)
+	if active_object != o:
+		_clear_elems()
+	active_object = o
+	if o == null and mode == Mode.EDIT:
+		mode = Mode.OBJECT
+	_refresh_lists()
+
+
+func clear_object_selection() -> void:
+	sel_objects.clear()
+	active_object = null
+	_clear_elems()
+	if mode == Mode.EDIT:
+		mode = Mode.OBJECT
+	_refresh_lists()
+
+
+func set_mode(m: Mode) -> void:
+	if m == Mode.EDIT and active_object == null:
+		return
+	mode = m
+	hover_kind = -1
+	hover_object = null
+	_refresh_lists()
+
+
+func set_elem(e: Elem) -> void:
+	elem = e
+	hover_kind = -1
+	_refresh_lists()
+
+
+func delete_selected() -> void:
+	if mode == Mode.OBJECT:
+		var doomed := sel_objects.duplicate()
+		clear_object_selection()
+		for o in doomed:
+			if not is_instance_valid(o):
+				continue
+			# Children keep their place in the world under the deleted one's parent.
+			var p: Node = o.get_parent()
+			for c in o.child_objects():
+				c.reparent(p, true)
+			p.remove_child(o)
+			o.queue_free()
+	else:
+		if active_object == null or sel_verts.is_empty():
+			return
+		active_object.data.delete_verts(sel_verts)
+		active_object.rebuild()
+		_clear_elems()
+	_refresh_lists()
+
+
+# --- element selection ---------------------------------------------------------
+
+func _clear_elems() -> void:
+	sel_verts.clear()
+	sel_edges.clear()
+	sel_faces.clear()
+
+
+## Set the selection from a vertex set and derive edges and faces from it.
+func select_verts(vs: Dictionary) -> void:
+	_clear_elems()
+	sel_verts = vs.duplicate()
+	var d := active_object.data
+	for e in d.edges.size():
+		if sel_verts.has(d.edges[e].x) and sel_verts.has(d.edges[e].y):
+			sel_edges[e] = true
+	for f in d.faces.size():
+		var all := true
+		for i in d.faces[f]:
+			if not sel_verts.has(i):
+				all = false
+				break
+		if all:
+			sel_faces[f] = true
+	_refresh_lists()
+
+
+func select_edges(es: Dictionary) -> void:
+	var d := active_object.data
+	var vs := {}
+	for e in es:
+		vs[d.edges[e].x] = true
+		vs[d.edges[e].y] = true
+	select_verts(vs)
+	# A vertex set can imply faces nobody picked (all four corners of a quad via
+	# its four edges is that quad, which is right; two verts never are).
+	sel_edges = es.duplicate()
+	_refresh_lists()
+
+
+func select_faces(fs: Dictionary) -> void:
+	var d := active_object.data
+	var vs := {}
+	for f in fs:
+		for i in d.faces[f]:
+			vs[i] = true
+	select_verts(vs)
+	sel_faces = fs.duplicate()
+	sel_edges.clear()
+	for f in fs:
+		var idx := d.faces[f]
+		for i in idx.size():
+			sel_edges[d.edge_index(idx[i], idx[(i + 1) % idx.size()])] = true
+	_refresh_lists()
+
+
+## Every vertex the current selection moves.
+func moving_verts() -> Dictionary:
+	return sel_verts
+
+
+# --- picking -------------------------------------------------------------------
+
+func _ray(pos: Vector2) -> Array:
+	var cam := camera()
+	return [cam.project_ray_origin(pos), cam.project_ray_normal(pos)]
+
+
+func pick_object(pos: Vector2) -> SceneObject:
+	var r := _ray(pos)
+	var best: SceneObject = null
+	var best_t := INF
+	for o in objects():
+		var inv := o.global_transform.affine_inverse()
+		var lo: Vector3 = inv * r[0]
+		var ld: Vector3 = (inv.basis * r[1]).normalized()
+		var hit := o.data.ray_hit(lo, ld)
+		if hit.is_empty():
+			continue
+		var wp: Vector3 = o.global_transform * hit.point
+		var t: float = (wp - r[0]).length()
+		if t < best_t:
+			best_t = t
+			best = o
+	return best
+
+
+func pick_vert(pos: Vector2, radius: float) -> int:
+	var o := active_object
+	var cam := camera()
+	var best := -1
+	var best_d := radius
+	for i in o.data.verts.size():
+		var w := o.global_transform * o.data.verts[i]
+		if cam.is_position_behind(w):
+			continue
+		var d := cam.unproject_position(w).distance_to(pos)
+		if d < best_d:
+			best_d = d
+			best = i
+	return best
+
+
+func pick_edge(pos: Vector2, radius: float) -> int:
+	var o := active_object
+	var cam := camera()
+	var best := -1
+	var best_d := radius
+	for e in o.data.edges.size():
+		var a := o.global_transform * o.data.verts[o.data.edges[e].x]
+		var b := o.global_transform * o.data.verts[o.data.edges[e].y]
+		if cam.is_position_behind(a) or cam.is_position_behind(b):
+			continue
+		var p := Geometry2D.get_closest_point_to_segment(pos, cam.unproject_position(a),
+				cam.unproject_position(b))
+		var d := p.distance_to(pos)
+		if d < best_d:
+			best_d = d
+			best = e
+	return best
+
+
+func pick_face(pos: Vector2) -> int:
+	var o := active_object
+	var r := _ray(pos)
+	var inv := o.global_transform.affine_inverse()
+	var hit := o.data.ray_hit(inv * r[0], (inv.basis * r[1]).normalized())
+	return hit.face if not hit.is_empty() else -1
+
+
+func pick_elem(pos: Vector2, radius: float) -> int:
+	match elem:
+		Elem.VERT: return pick_vert(pos, radius)
+		Elem.EDGE: return pick_edge(pos, radius)
+		_: return pick_face(pos)
+
+
+## Select whatever is at `pos`; nothing there clears the selection.
+func tap(pos: Vector2, radius: float) -> void:
+	if not view_rect.has_point(pos):
+		return
+	if mode == Mode.OBJECT:
+		var o := pick_object(pos)
+		if o == null:
+			clear_object_selection()
+		else:
+			select_object(o)
+		return
+	var i := pick_elem(pos, radius)
+	match elem:
+		Elem.VERT: select_verts({i: true} if i >= 0 else {})
+		Elem.EDGE: select_edges({i: true} if i >= 0 else {})
+		_: select_faces({i: true} if i >= 0 else {})
+
+
+func box_rect() -> Rect2:
+	return Rect2(_box_from, _box_to - _box_from).abs()
+
+
+## Select everything inside the box: objects by origin, verts by position,
+## edges and faces when every vertex of theirs is inside.
+func box_select(rect: Rect2) -> void:
+	var cam := camera()
+	if mode == Mode.OBJECT:
+		sel_objects.clear()
+		for o in objects():
+			var w := o.global_position
+			if not cam.is_position_behind(w) and rect.has_point(cam.unproject_position(w)):
+				sel_objects.append(o)
+		if sel_objects.is_empty():
+			clear_object_selection()
+			return
+		if not sel_objects.has(active_object):
+			active_object = sel_objects[0]
+		_refresh_lists()
+		return
+	var d := active_object.data
+	var inside := {}
+	for i in d.verts.size():
+		var w := active_object.global_transform * d.verts[i]
+		if not cam.is_position_behind(w) and rect.has_point(cam.unproject_position(w)):
+			inside[i] = true
+	match elem:
+		Elem.VERT:
+			select_verts(inside)
+		Elem.EDGE:
+			var es := {}
+			for e in d.edges.size():
+				if inside.has(d.edges[e].x) and inside.has(d.edges[e].y):
+					es[e] = true
+			select_edges(es)
+		_:
+			var fs := {}
+			for f in d.faces.size():
+				var all := true
+				for i in d.faces[f]:
+					if not inside.has(i):
+						all = false
+						break
+				if all:
+					fs[f] = true
+			select_faces(fs)
+
+
+func update_hover(pos: Vector2, radius: float) -> void:
+	hover_object = null
+	hover_kind = -1
+	hover_index = -1
+	if not view_rect.has_point(pos):
+		return
+	if mode == Mode.OBJECT:
+		hover_object = pick_object(pos)
+	elif active_object != null:
+		hover_index = pick_elem(pos, radius)
+		hover_kind = elem if hover_index >= 0 else -1
+
+
+# --- moving --------------------------------------------------------------------
+
+func has_moveable() -> bool:
+	if mode == Mode.OBJECT:
+		return not sel_objects.is_empty()
+	return active_object != null and not sel_verts.is_empty()
+
+
+## Objects to move: the selected ones whose ancestors are not also selected.
+func _move_roots() -> Array[SceneObject]:
+	var out: Array[SceneObject] = []
+	for o in sel_objects:
+		var covered := false
+		for p in sel_objects:
+			if p != o and o.is_descendant_of(p):
+				covered = true
+				break
+		if not covered:
+			out.append(o)
+	return out
+
+
+func move_begin(pos: Vector2) -> void:
+	var pivot := Vector3.ZERO
+	_move_obj_start.clear()
+	if mode == Mode.OBJECT:
+		var roots := _move_roots()
+		for o in roots:
+			_move_obj_start[o] = o.global_position
+			pivot += o.global_position
+		pivot /= float(maxi(roots.size(), 1))
+	else:
+		_move_vert_start = active_object.data.verts.duplicate()
+		for i in sel_verts:
+			pivot += active_object.global_transform * _move_vert_start[i]
+		pivot /= float(maxi(sel_verts.size(), 1))
+	_move_plane = Plane(camera().global_basis.z, pivot)
+	_move_start = _plane_point(pos, pivot)
+
+
+func _plane_point(pos: Vector2, fallback: Vector3) -> Vector3:
+	var r := _ray(pos)
+	var p = _move_plane.intersects_ray(r[0], r[1])
+	return p if p != null else fallback
+
+
+func move_update(pos: Vector2) -> void:
+	var delta := _plane_point(pos, _move_start) - _move_start
+	if mode == Mode.OBJECT:
+		for o in _move_obj_start:
+			if is_instance_valid(o):
+				o.global_position = _move_obj_start[o] + delta
+		return
+	var o := active_object
+	var local := o.global_transform.basis.inverse() * delta
+	for i in sel_verts:
+		o.data.verts[i] = _move_vert_start[i] + local
+	o.rebuild()
+
+
+func move_end() -> void:
+	_move_obj_start.clear()
+
+
+# --- input ---------------------------------------------------------------------
+# A gesture that began in the view keeps its pointer until it lifts, even when
+# it crosses a panel: those continuations are taken in `_input`, ahead of the
+# GUI. Everything else (presses, hover, the wheel) is whatever the panels did
+# not take, in `_unhandled_input`.
+
+func _input(event: InputEvent) -> void:
+	var touch := event as InputEventScreenTouch
+	var drag := event as InputEventScreenDrag
+	var click := event as InputEventMouseButton
+	var motion := event as InputEventMouseMotion
+	var mine := false
+	if touch != null and not touch.pressed and _touches.has(touch.index):
+		_touch(touch)
+		mine = true
+	elif drag != null and _touches.has(drag.index):
+		_touch_drag(drag)
+		mine = true
+	elif click != null and not click.pressed and (
+			(click.button_index == MOUSE_BUTTON_LEFT and _pen_down)
+			or (click.button_index == MOUSE_BUTTON_MIDDLE and _middle_down)):
+		_pen_button(click)
+		mine = true
+	elif motion != null and (_pen_down or _middle_down):
+		_pen_motion(motion)
+		mine = true
+	if mine:
+		get_viewport().set_input_as_handled()
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	var touch := event as InputEventScreenTouch
+	var drag := event as InputEventScreenDrag
+	var click := event as InputEventMouseButton
+	var motion := event as InputEventMouseMotion
+	if touch != null:
+		_touch(touch)
+	elif drag != null:
+		_touch_drag(drag)
+	elif click != null:
+		_pen_button(click)
+	elif motion != null:
+		_pen_motion(motion)
+
+
+func _touch(t: InputEventScreenTouch) -> void:
+	if t.pressed:
+		if not view_rect.has_point(t.position) and _touches.is_empty():
+			return
+		_touches[t.index] = {"pos": t.position, "start": t.position, "time": 0.0, "cancelled": false}
+		if _touches.size() == 2:
+			for k in _touches:
+				_touches[k].cancelled = true
+			if _finger_moving:
+				move_end()
+				_finger_moving = false
+			_pinch_reset()
+		elif _touches.size() > 2:
+			_touches[t.index].cancelled = true
+		return
+	if not _touches.has(t.index):
+		return
+	var info: Dictionary = _touches[t.index]
+	_touches.erase(t.index)
+	if _finger_moving and _touches.is_empty():
+		move_end()
+		_finger_moving = false
+		return
+	if not info.cancelled and info.pos.distance_to(info.start) <= TAP_SLOP \
+			and info.time <= TAP_TIME:
+		tap(t.position, FINGER_RADIUS)
+	if _touches.size() == 1:
+		# The finger left behind must lift before it counts for anything again.
+		for k in _touches:
+			_touches[k].cancelled = true
+
+
+func _touch_drag(d: InputEventScreenDrag) -> void:
+	if not _touches.has(d.index):
+		return
+	var info: Dictionary = _touches[d.index]
+	var prev: Vector2 = info.pos
+	info.pos = d.position
+	if _touches.size() == 1:
+		if info.cancelled:
+			return
+		var moved: bool = info.pos.distance_to(info.start) > TAP_SLOP
+		if _finger_moving:
+			move_update(d.position)
+		elif pointer == Pointer.MOVE and has_moveable():
+			if moved:
+				_finger_moving = true
+				move_begin(info.start)
+				move_update(d.position)
+		elif pointer != Pointer.TOOL:
+			orbit.orbit(d.position - prev)
+	elif _touches.size() == 2:
+		var keys := _touches.keys()
+		var a: Vector2 = _touches[keys[0]].pos
+		var b: Vector2 = _touches[keys[1]].pos
+		var center := (a + b) * 0.5
+		var dist := a.distance_to(b)
+		if _pinch_dist > 0.0:
+			orbit.pan(center - _pinch_center)
+			orbit.zoom(dist / _pinch_dist)
+		_pinch_center = center
+		_pinch_dist = dist
+
+
+func _pinch_reset() -> void:
+	var keys := _touches.keys()
+	if keys.size() < 2:
+		_pinch_dist = 0.0
+		return
+	var a: Vector2 = _touches[keys[0]].pos
+	var b: Vector2 = _touches[keys[1]].pos
+	_pinch_center = (a + b) * 0.5
+	_pinch_dist = a.distance_to(b)
+
+
+func _process(delta: float) -> void:
+	for k in _touches:
+		_touches[k].time += delta
+
+
+func _pen_button(c: InputEventMouseButton) -> void:
+	match c.button_index:
+		MOUSE_BUTTON_LEFT:
+			if c.pressed:
+				if not view_rect.has_point(c.position):
+					return
+				_pen_down = true
+				_pen_start = c.position
+				_pen_dragging = false
+				_pen_moving = false
+			elif _pen_down:
+				_pen_down = false
+				if _pen_moving:
+					move_end()
+				elif box_active:
+					box_active = false
+					box_select(box_rect())
+				elif not _pen_dragging:
+					tap(c.position, PEN_RADIUS)
+				_pen_moving = false
+		MOUSE_BUTTON_MIDDLE:
+			_middle_down = c.pressed and view_rect.has_point(c.position)
+		MOUSE_BUTTON_WHEEL_UP:
+			if view_rect.has_point(c.position):
+				orbit.zoom(1.1)
+		MOUSE_BUTTON_WHEEL_DOWN:
+			if view_rect.has_point(c.position):
+				orbit.zoom(1.0 / 1.1)
+
+
+func _pen_motion(m: InputEventMouseMotion) -> void:
+	pen_hover_valid = view_rect.has_point(m.position)
+	pen_hover_pos = m.position
+	if _middle_down:
+		orbit.orbit(m.relative)
+		return
+	if not _pen_down:
+		update_hover(m.position, PEN_RADIUS)
+		return
+	if not _pen_dragging:
+		if m.position.distance_to(_pen_start) <= TAP_SLOP:
+			return
+		_pen_dragging = true
+		if pointer == Pointer.MOVE and has_moveable():
+			_pen_moving = true
+			move_begin(_pen_start)
+		elif pointer != Pointer.TOOL:
+			box_active = true
+			_box_from = _pen_start
+	if _pen_moving:
+		move_update(m.position)
+	elif box_active:
+		_box_to = m.position

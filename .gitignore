@@ -1,0 +1,12 @@
+# Godot 4 import cache and Android gradle template.
+.godot/
+/android/
+
+# *.import is NOT ignored: it carries each asset's uid and import settings.
+
+# Export config can hold keystore paths and passwords. tools/TOOL_build_apk.sh
+# writes it from a heredoc on every run.
+export_presets.cfg
+
+# Export output.
+/build/

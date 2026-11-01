@@ -1,0 +1,21 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://scripts/SCRIPT_editor.gd" id="1_editor"]
+[ext_resource type="Script" path="res://scripts/SCRIPT_orbit_camera.gd" id="2_orbit"]
+
+[node name="Editor" type="Node3D"]
+script = ExtResource("1_editor")
+
+[node name="Scene" type="Node3D" parent="."]
+
+[node name="OrbitCamera" type="Node3D" parent="."]
+script = ExtResource("2_orbit")
+
+[node name="Camera3D" type="Camera3D" parent="OrbitCamera"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 8)
+fov = 50.0
+near = 0.05
+far = 500.0
+
+[node name="UI" type="CanvasLayer" parent="."]
+layer = 200
