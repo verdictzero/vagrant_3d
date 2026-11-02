@@ -6,8 +6,9 @@ extends Control
 ## bottom-left of the view while a tool is live. One Control, drawn and
 ## hit-tested by region, so a finger and the pen drive it the same way.
 ##
-## A property: { label, value, span, unit, decimals }. The slider runs
-## -span .. +span; the number shows the true value even past the ends.
+## A property: { label, value, min, max, origin, unit, decimals }. The
+## slider runs min .. max and its fill grows from `origin` (0 for a length,
+## 1 for a scale); the number shows the true value even past the ends.
 
 const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
 const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
@@ -16,8 +17,8 @@ signal value_changed(index: int, v: float)
 signal applied
 signal cancelled
 
-const W := 440.0
-const LABEL_W := 60.0
+const W := 470.0
+const LABEL_W := 100.0
 const VALUE_W := 104.0
 const KNOB := 12.0
 
@@ -78,19 +79,24 @@ func region_at(pos: Vector2) -> String:
 	return ""
 
 
-func knob_x(i: int) -> float:
+## Where value `v` of property `i` falls along its track, in local x.
+func value_x(i: int, v: float) -> float:
 	var tr := track_rect(i)
 	var inset := T.PAD + KNOB
-	var span: float = props[i].span
-	return tr.position.x + inset + (clampf(props[i].value, -span, span) + span) / (2.0 * span) * (tr.size.x - inset * 2.0)
+	var lo: float = props[i].min
+	var hi: float = props[i].max
+	return tr.position.x + inset + (clampf(v, lo, hi) - lo) / (hi - lo) * (tr.size.x - inset * 2.0)
+
+
+func knob_x(i: int) -> float:
+	return value_x(i, props[i].value)
 
 
 func value_at(i: int, x: float) -> float:
 	var tr := track_rect(i)
 	var inset := T.PAD + KNOB
 	var t := clampf((x - tr.position.x - inset) / (tr.size.x - inset * 2.0), 0.0, 1.0)
-	var span: float = props[i].span
-	return -span + t * 2.0 * span
+	return lerpf(props[i].min, props[i].max, t)
 
 
 # --- input --------------------------------------------------------------------
@@ -166,7 +172,7 @@ func _draw() -> void:
 		var base := r.position.y + RowList._baseline(ui, T.FS_BODY, r.size.y)
 		draw_string(bold if live else ui, Vector2(T.PAD, base), p.label, HORIZONTAL_ALIGNMENT_LEFT, -1,
 				T.FS_BODY, T.COL_CURSOR if live else T.COL_READY)
-		# The track: a rule, a tick at each quarter, the zero tick taller.
+		# The track: a rule, a tick at each eighth, the origin's tick taller.
 		var tr := track_rect(i)
 		var cy := r.get_center().y
 		var inset := T.PAD + KNOB
@@ -175,10 +181,10 @@ func _draw() -> void:
 		draw_line(Vector2(x0, cy), Vector2(x1, cy), T.COL_DIM, 1.0)
 		for k in 9:
 			var tx := x0 + float(k) / 8.0 * (x1 - x0)
-			var th := 7.0 if k == 4 else 3.0
-			draw_line(Vector2(tx, cy - th), Vector2(tx, cy + th), T.COL_WAIT, 1.0)
-		# The value as a fill from zero, then the knob on top.
-		var zx := x0 + 0.5 * (x1 - x0)
+			draw_line(Vector2(tx, cy - 3.0), Vector2(tx, cy + 3.0), T.COL_WAIT, 1.0)
+		var zx := value_x(i, p.get("origin", 0.0))
+		draw_line(Vector2(zx, cy - 7.0), Vector2(zx, cy + 7.0), T.COL_WAIT, 1.0)
+		# The value as a fill from the origin, then the knob on top.
 		var kx := knob_x(i)
 		draw_line(Vector2(zx, cy), Vector2(kx, cy), T.COL_READY, 3.0)
 		draw_rect(Rect2(kx - KNOB * 0.5, cy - KNOB * 0.5, KNOB, KNOB), T.COL_CURSOR if live else T.COL_NAME, true)

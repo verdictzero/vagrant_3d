@@ -54,6 +54,9 @@ func _initialize() -> void:
 	await _delete()
 	await _groups()
 	await _scroll()
+	await _new_tools()
+	await _history()
+	await _scrub_and_keys()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -368,7 +371,8 @@ func _tools() -> void:
 	await _settle()
 	ok(ed.toolbar.index_of("EXTRUDE") >= 0 and ed.toolbar.index_of("EXTRUDE NORMALS") >= 0
 			and ed.toolbar.index_of("ROTATE") >= 0, "in EDIT the tool column has ROTATE, EXTRUDE and EXTRUDE NORMALS")
-	ok(ed.toolbar.items[ed.toolbar.index_of("BEVEL")].disabled, "BEVEL is on it and dimmed")
+	ok(not ed.toolbar.items[ed.toolbar.index_of("INSET")].disabled and not ed.toolbar.items[ed.toolbar.index_of("BEVEL")].disabled,
+			"with a face selected INSET and BEVEL are live too")
 	var p := _row_center(ed.toolbar, ed.toolbar.index_of("EXTRUDE"))
 	_finger(0, p, true)
 	_finger(0, p, false)
@@ -761,3 +765,246 @@ func _delete() -> void:
 	for f in a.data.face_count():
 		drawn += (a.data.faces[f].size() - 2) * 3
 	ok(a.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size() == drawn, "the drawn mesh follows")
+
+
+func _key(code: Key, ctrl := false, shift := false) -> void:
+	var e := InputEventKey.new()
+	e.keycode = code
+	e.pressed = true
+	e.ctrl_pressed = ctrl
+	e.shift_pressed = shift
+	root.push_input(e, true)
+
+
+func _frame(target: Vector3) -> void:
+	ed.orbit.set_ortho(false)
+	ed.orbit.yaw = -0.6
+	ed.orbit.pitch = -0.5
+	ed.orbit.distance = 8.0
+	ed.orbit.target = target
+	ed.orbit.apply()
+
+
+func _fresh_cube(at: Vector3) -> Node3D:
+	ed.set_mode(ed.Mode.OBJECT)
+	var c: Node3D = ed.add_primitive("CUBE")
+	c.global_position = at
+	_frame(at)
+	return c
+
+
+func _new_tools() -> void:
+	var c := _fresh_cube(Vector3(0, 0, 12))
+	await _settle()
+	ok(ed.toolbar.index_of("SCALE") >= 0, "SCALE is on the object-mode column")
+	ok(ed.tool_start("SCALE") and ed.tool_job.props[0].origin == 1.0, "SCALE starts at 1")
+	ed.tool_set(0, 1.93)
+	ok(is_equal_approx(c.scale.x, 1.9) and is_equal_approx(c.scale.y, 1.0), "X by slider, snapped to 1.9 (%s)" % c.scale)
+	ok(c.global_position.is_equal_approx(Vector3(0, 0, 12)), "about the object's own origin")
+	ed.tool_apply()
+	ed._refresh_props()
+	var scl: Array = []
+	for it in ed.props_list.items:
+		if String(it.id).begins_with("scl"):
+			scl.append(it.value)
+	ok(scl == ["1.900", "1.000", "1.000"], "the properties show the scale (%s)" % str(scl))
+	# A drag away from the pivot scales up evenly.
+	c.scale = Vector3.ONE
+	ed.pointer = ed.Pointer.TOOL
+	ed.current_tool = "SCALE"
+	var p := _screen(c.global_position)
+	_pen_drag(p + Vector2(60, 0), p + Vector2(120, 0))
+	await _settle()
+	ok(ed.tool_kind() == "SCALE" and c.scale.x > 1.5 and is_equal_approx(c.scale.x, c.scale.z),
+			"a drag outward scales up evenly (%s)" % c.scale)
+	ed.tool_cancel()
+	ok(c.scale.is_equal_approx(Vector3.ONE), "CANCEL puts the scale back")
+	ed.pointer = ed.Pointer.SELECT
+	# Inset from the tool column.
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.FACE)
+	ed.select_faces({1: true})
+	await _settle()
+	var f0: int = c.data.face_count()
+	p = _row_center(ed.toolbar, ed.toolbar.index_of("INSET"))
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.tool_kind() == "INSET" and ed.tool_job.props.size() == 2, "INSET from the column, with THICKNESS and DEPTH")
+	ed.tool_set(0, 0.33)
+	ok(is_equal_approx(ed.tool_value(0), 0.35), "thickness snaps in fifths of the step (%.2f)" % ed.tool_value(0))
+	ed.tool_set(1, 0.5)
+	ok(c.data.face_count() == f0 + 4, "a ring of four faces (%d)" % c.data.face_count())
+	var raised := true
+	for i in ed.sel_verts:
+		raised = raised and is_equal_approx(c.data.verts[i].y, 1.5)
+	ok(raised and ed.sel_faces.size() == 1, "the inner face is selected and raised by DEPTH")
+	ed.tool_apply()
+	# Bevel an edge of a second cube.
+	var b := _fresh_cube(Vector3(4, 0, 12))
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.EDGE)
+	ed.select_edges({b.data.edge_index(4, 5): true})
+	ok(ed.tool_start("BEVEL"), "BEVEL starts on an edge")
+	ed.tool_set(0, 0.25)
+	ok(b.data.face_count() == 7 and b.data.vert_count() == 10, "the edge is a strip (%d f, %d v)" % [b.data.face_count(), b.data.vert_count()])
+	ok(ed.sel_faces.size() == 1, "and the strip is selected")
+	ed.tool_cancel()
+	ok(b.data.face_count() == 6 and b.data.vert_count() == 8, "CANCEL puts the cube back")
+	ed.select_edges({})
+	ok(ed.toolbar.items[ed.toolbar.index_of("BEVEL")].disabled, "BEVEL is dimmed with no edge selected")
+	ed.set_mode(ed.Mode.OBJECT)
+
+
+func _history() -> void:
+	ed.clear_object_selection()
+	var n0: int = ed.objects().size()
+	var h0: int = ed.history_index
+	var c: Node3D = ed.add_primitive("CUBE")
+	ok(ed.history_index == h0 + 1 and ed.history_label() == "ADD CUBE", "adding is an undo step (%s)" % ed.history_label())
+	var p := _row_center(ed.history_bar, 0)
+	_pen_tap(p)
+	await _settle()
+	ok(ed.objects().size() == n0, "UNDO in the header takes the cube away")
+	ok(ed.can_redo() and not ed.history_bar.items[1].disabled, "and REDO is live")
+	_pen_tap(_row_center(ed.history_bar, 1))
+	await _settle()
+	ok(ed.objects().size() == n0 + 1, "REDO brings it back")
+	c = ed.objects()[ed.objects().size() - 1]
+	ok(c.name == "Cube 017" or c.name.begins_with("Cube"), "under its name (%s)" % c.name)
+	ok(ed.active_object == c, "selected, as it was")
+	# A move, applied, then undone.
+	_frame(c.global_position)
+	ed.select_object(c)
+	var start: Vector3 = c.global_position
+	ed.tool_start("TRANSLATE")
+	ed.tool_set(0, 1.0)
+	ed.tool_apply()
+	ok(c.global_position.is_equal_approx(start + Vector3(1, 0, 0)), "moved by a unit")
+	ed.undo()
+	c = ed.active_object
+	ok(c != null and c.global_position.is_equal_approx(start), "undo puts it back")
+	# An extrude in EDIT: undo keeps EDIT and the face that was picked.
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.FACE)
+	ed.select_faces({1: true})
+	ed.tool_start("EXTRUDE")
+	ed.tool_set(0, 0.5)
+	ed.tool_apply()
+	ok(ed.active_object.data.face_count() == 10, "extruded")
+	ed.undo()
+	ok(ed.active_object.data.face_count() == 6, "undo takes the extrude away")
+	ok(ed.mode == ed.Mode.EDIT and ed.sel_faces.has(1) and ed.sel_faces.size() == 1,
+			"and leaves EDIT with the top face picked, as it was")
+	ed.redo()
+	ok(ed.active_object.data.face_count() == 10, "redo brings it back")
+	# With a tool live, undo cancels it.
+	ed.select_faces({0: true})
+	ed.tool_start("EXTRUDE")
+	ed.tool_set(0, 1.0)
+	var h1: int = ed.history_index
+	ed.undo()
+	ok(not ed.tool_live() and ed.active_object.data.face_count() == 10 and ed.history_index == h1,
+			"undo with a tool live cancels it and goes no further")
+	ed.set_mode(ed.Mode.OBJECT)
+	# A tool that did nothing is not a step.
+	ed.tool_start("ROTATE")
+	ed.tool_apply()
+	ok(ed.history_index == h1, "a tool applied at zero is not an undo step")
+	# Fingers: two tapped together undo, three redo, a pinch does neither.
+	ed.add_primitive("SPHERE")
+	var n1: int = ed.objects().size()
+	var v1: Vector2 = ed.view_rect.get_center() + Vector2(-40, 120)
+	var v2: Vector2 = v1 + Vector2(90, 0)
+	var v3: Vector2 = v1 + Vector2(45, 60)
+	_finger(0, v1, true)
+	_finger(1, v2, true)
+	_finger(0, v1, false)
+	_finger(1, v2, false)
+	await _settle()
+	ok(ed.objects().size() == n1 - 1, "a two-finger tap undoes the sphere")
+	_finger(0, v1, true)
+	_finger(1, v2, true)
+	_finger(2, v3, true)
+	_finger(2, v3, false)
+	_finger(1, v2, false)
+	_finger(0, v1, false)
+	await _settle()
+	ok(ed.objects().size() == n1, "a three-finger tap redoes it")
+	_finger(0, v1, true)
+	_finger(1, v2, true)
+	_finger_move(0, v1, v1 + Vector2(-60, 0))
+	_finger_move(1, v2, v2 + Vector2(60, 0))
+	_finger(0, v1 + Vector2(-60, 0), false)
+	_finger(1, v2 + Vector2(60, 0), false)
+	await _settle()
+	ok(ed.objects().size() == n1, "a pinch is not an undo")
+	# Every kind of change undoes: parent, group, delete.
+	var a: Node3D = ed.objects()[0]
+	var s: Node3D = ed.objects()[ed.objects().size() - 1]
+	ed.reparent_object(s, a)
+	ok(ed.history_label() == "PARENT", "parenting is a step")
+	ed.undo()
+	ok(ed.objects()[ed.objects().size() - 1].get_parent() == ed.world_root, "undone, the sphere is back at the root")
+	ed.select_object(ed.objects()[ed.objects().size() - 1])
+	ed.delete_selected()
+	ok(ed.objects().size() == n1 - 1 and ed.history_label() == "DELETE", "delete is a step")
+	ed.undo()
+	ok(ed.objects().size() == n1, "undone, the sphere is back")
+	# The history is capped.
+	for i in 70:
+		ed.history.append(ed.history[ed.history_index])
+	ed.history_index = ed.history.size() - 1
+	ed.push_undo("CAP")
+	ok(ed.history.size() <= ed.HISTORY_MAX, "the history keeps at most %d steps (%d)" % [ed.HISTORY_MAX, ed.history.size()])
+
+
+func _scrub_and_keys() -> void:
+	ed.set_mode(ed.Mode.OBJECT)
+	var c := _fresh_cube(Vector3(0, 0, 20))
+	await _settle()
+	ed._refresh_props()
+	var i: int = ed.props_list.index_of("loc0")
+	ok(i >= 0 and ed.props_list.items[i].get("scrub", false), "location X is a field")
+	var p: Vector2 = ed.props_list.global_position + ed.props_list.row_rect(i).get_center()
+	var h0: int = ed.history_index
+	_pen_drag(p, p + Vector2(100, 0))
+	await _settle()
+	ok(is_equal_approx(c.position.x, 1.0), "dragging it 100 px right adds a unit (%.2f)" % c.position.x)
+	ok(ed.history_label() == "PROPERTIES" and ed.history_index == ed.history.size() - 1, "as one undo step")
+	ed.undo()
+	ok(is_zero_approx(ed.active_object.position.x), "which undoes")
+	ed.redo()
+	c = ed.active_object
+	i = ed.props_list.index_of("rot1")
+	p = ed.props_list.global_position + ed.props_list.row_rect(i).get_center()
+	_pen_drag(p, p + Vector2(-60, 0))
+	await _settle()
+	ok(is_equal_approx(c.rotation_degrees.y, -30.0), "rotation Y by -60 px is -30 degrees (%.1f)" % c.rotation_degrees.y)
+	_key(KEY_Z, true)
+	await _settle()
+	c = ed.active_object
+	ok(is_zero_approx(c.rotation_degrees.y) and is_equal_approx(c.position.x, 1.0), "Ctrl+Z undoes the rotation only")
+	_key(KEY_Z, true, true)
+	await _settle()
+	ok(is_equal_approx(ed.active_object.rotation_degrees.y, -30.0), "Ctrl+Shift+Z redoes it")
+	_key(KEY_TAB)
+	ok(ed.mode == ed.Mode.EDIT, "Tab enters EDIT")
+	_key(KEY_3)
+	ok(ed.elem == ed.Elem.FACE, "3 is faces")
+	_key(KEY_E)
+	ok(ed.pointer == ed.Pointer.TOOL and ed.current_tool == "EXTRUDE", "E picks EXTRUDE")
+	_key(KEY_ESCAPE)
+	_key(KEY_TAB)
+	ok(ed.mode == ed.Mode.OBJECT, "Tab leaves EDIT")
+	_key(KEY_KP_7)
+	ok(ed.orbit.view_name() == "TOP", "numpad 7 is TOP")
+	_key(KEY_KP_7)
+	ok(ed.orbit.view_name() == "TOP", "and again is still TOP, not a flip")
+	_key(KEY_KP_1, true)
+	ok(ed.orbit.view_name() == "BACK", "Ctrl+numpad 1 is BACK")
+	_key(KEY_A, false, true)
+	ok(ed.popover.visible and ed.popover_kind == "ADD", "Shift+A opens ADD")
+	_key(KEY_ESCAPE)
+	ok(not ed.popover.visible, "Escape closes it")
+	_frame(Vector3.ZERO)

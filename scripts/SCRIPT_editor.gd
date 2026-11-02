@@ -35,17 +35,23 @@ const TAP_TIME := 0.35
 const POPOVER_W := 272.0
 
 const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
-const TOOLS := ["TRANSLATE", "ROTATE", "EXTRUDE", "EXTRUDE NORMALS"]
-const TOOLS_LATER := ["BEVEL", "INSET"]
-## The tool column, per mode. SELECT and MOVE are pointers; the rest are tools.
+const TOOLS := ["TRANSLATE", "ROTATE", "SCALE", "EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL"]
+const MESH_TOOLS := ["EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL"]
+## The tool column, per mode, in Blender's order. SELECT and MOVE are
+## pointers; the rest are tools.
 const TOOLBAR := {
-	Mode.OBJECT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["DELETE", &"delete"]],
-	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["EXTRUDE", &"extrude"],
-		["EXTRUDE NORMALS", &"extrude_normals"], ["BEVEL", &"bevel"], ["INSET", &"inset"], ["DELETE", &"delete"]],
+	Mode.OBJECT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
+		["DELETE", &"delete"]],
+	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
+		["EXTRUDE", &"extrude"], ["EXTRUDE NORMALS", &"extrude_normals"], ["INSET", &"inset"],
+		["BEVEL", &"bevel"], ["DELETE", &"delete"]],
 }
 const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
 const ROT_DEG_PER_PX := 0.5
 const ROT_STEP := 5.0
+const SCALE_STEP := 0.1
+const HISTORY_MAX := 64
+const GESTURE_TAP_MS := 350
 const STEPS := [1.0, 0.5, 0.25, 0.1]
 
 # --- state -------------------------------------------------------------------
@@ -88,6 +94,15 @@ var _tool_backup: MeshData
 var _tool_sel_backup: Array = []
 var _tool_drag_from: Array = []
 var _tool_drag_origin := Vector2.ZERO
+var _tool_drag_pivot := Vector2.ZERO
+
+# History: whole-scene snapshots, one per committed change. Each step also
+# carries the selection that was there going into the change after it, so
+# an undo lands where the user was, not where the scene was saved.
+var history: Array = []
+var history_index := -1
+var _before: Dictionary = {}
+var _scrub_start := 0.0
 
 # --- nodes -------------------------------------------------------------------
 
@@ -109,6 +124,7 @@ var add_menu: RowList
 var toggle_list: RowList
 var gizmo: NavGizmo
 var proj_list: RowList
+var history_bar: RowList
 var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
@@ -130,6 +146,9 @@ var _pen_moving := false
 var _pen_tooling := false
 var _finger_tooling := false
 var _middle_down := false
+var _gesture_t0 := 0
+var _gesture_max := 0
+var _gesture_moved := false
 var _move_plane := Plane()
 var _move_start := Vector3.ZERO
 var _move_pivot := Vector3.ZERO
@@ -143,6 +162,7 @@ func _ready() -> void:
 	_build_ui()
 	get_viewport().size_changed.connect(_layout)
 	_layout()
+	push_undo("START")
 	_refresh_lists()
 
 
@@ -217,6 +237,9 @@ func _build_ui() -> void:
 
 	_headings.append(_heading("PROPERTIES"))
 	props_list = Rows.new()
+	props_list.scrub_started.connect(_on_prop_scrub_started)
+	props_list.scrubbed.connect(_on_prop_scrubbed)
+	props_list.scrub_ended.connect(_on_prop_scrub_ended)
 	ui.add_child(props_list)
 
 	toolbar = Rows.new()
@@ -233,6 +256,9 @@ func _build_ui() -> void:
 	add_bar = _bar([{"id": "ADD", "text": "ADD", "icon": &"add"}], _on_toggle_tapped)
 	toggle_list = _bar([{"id": "SNAP", "text": "SNAP", "icon": &"snap", "lit": true},
 			{"id": "SHADING", "text": "SHADING", "icon": &"shading"}], _on_toggle_tapped)
+	history_bar = _bar([{"id": "UNDO", "text": "UNDO", "icon": &"undo"},
+			{"id": "REDO", "text": "REDO", "icon": &"redo"}], _on_history_tapped)
+	history_bar.icon_only = true
 
 	gizmo = Gizmo.new()
 	gizmo.camera = camera()
@@ -322,6 +348,8 @@ func _layout() -> void:
 		x += l.size.x + T.GUTTER
 	toggle_list.size = toggle_list.content_size()
 	toggle_list.position = Vector2(top_panel.position.x + top_panel.size.x - 6.0 - toggle_list.size.x, ry)
+	history_bar.size = history_bar.content_size()
+	history_bar.position = Vector2(toggle_list.position.x - T.GUTTER * 2.0 - history_bar.size.x, ry)
 	# Tool column, under the header.
 	var top := m + BAR_H + T.GUTTER
 	left_panel.position = Vector2(m, top)
@@ -361,6 +389,9 @@ func _refresh_lists() -> void:
 	add_bar.set_active("ADD" if popover.visible and popover_kind == "ADD" else null)
 	proj_list.items[0].lit = orbit.ortho
 	proj_list.set_active(null)
+	history_bar.items[0].disabled = not can_undo()
+	history_bar.items[1].disabled = not can_redo()
+	history_bar.queue_redraw()
 	mode_list.queue_redraw()
 	elem_list.queue_redraw()
 	toggle_list.queue_redraw()
@@ -401,14 +432,16 @@ func _refresh_props() -> void:
 		props_list.set_items(rows)
 		return
 	rows.append({"id": "_name", "text": o.name, "icon": &"group" if o.is_group else &"mesh", "inert": true})
+	# Location, rotation and scale are fields: drag one sideways to change it.
 	rows.append({"id": "_tl", "text": "LOCATION", "heading": true})
-	var pos := o.position
 	for i in 3:
-		rows.append({"id": "_l%d" % i, "text": "XYZ"[i], "value": "%+.2f" % pos[i], "value_clock": true, "inert": true})
+		rows.append({"id": "loc%d" % i, "text": "XYZ"[i], "value": "%+.2f" % o.position[i], "value_clock": true, "scrub": true})
 	rows.append({"id": "_tr", "text": "ROTATION", "heading": true})
-	var rot := o.rotation_degrees
 	for i in 3:
-		rows.append({"id": "_r%d" % i, "text": "XYZ"[i], "value": "%+.1f" % rot[i], "value_clock": true, "inert": true})
+		rows.append({"id": "rot%d" % i, "text": "XYZ"[i], "value": "%+.1f" % o.rotation_degrees[i], "value_clock": true, "scrub": true})
+	rows.append({"id": "_ts", "text": "SCALE", "heading": true})
+	for i in 3:
+		rows.append({"id": "scl%d" % i, "text": "XYZ"[i], "value": "%.3f" % o.scale[i], "value_clock": true, "scrub": true})
 	if o.has_mesh():
 		rows.append({"id": "_tm", "text": "MESH", "heading": true})
 		rows.append({"id": "_mv", "text": "VERTS", "value": "%03d" % o.data.vert_count(), "value_clock": true, "inert": true})
@@ -418,6 +451,59 @@ func _refresh_props() -> void:
 		rows.append({"id": "_tg", "text": "GROUP", "heading": true})
 		rows.append({"id": "_gc", "text": "CHILDREN", "value": "%03d" % o.child_objects().size(), "value_clock": true, "inert": true})
 	props_list.set_items(rows)
+
+
+func _prop_get(id: String) -> float:
+	var i := int(id.substr(3))
+	match id.left(3):
+		"loc": return active_object.position[i]
+		"rot": return active_object.rotation_degrees[i]
+		_: return active_object.scale[i]
+
+
+func _prop_set(id: String, v: float) -> void:
+	var i := int(id.substr(3))
+	match id.left(3):
+		"loc":
+			var p := active_object.position
+			p[i] = v
+			active_object.position = p
+		"rot":
+			var r := active_object.rotation_degrees
+			r[i] = v
+			active_object.rotation_degrees = r
+		_:
+			var sc := active_object.scale
+			sc[i] = maxf(v, 0.001)
+			active_object.scale = sc
+
+
+func _on_prop_scrub_started(id: Variant) -> void:
+	if active_object == null or not (id is String) or not id.left(3) in ["loc", "rot", "scl"]:
+		return
+	_tool_finish()
+	_mark_before()
+	_scrub_start = _prop_get(id)
+
+
+## Sideways pixels to a value: a hundredth of a unit, half a degree, or half
+## a percent of scale per pixel, rounded to what the field shows.
+func _on_prop_scrubbed(id: Variant, dx: float) -> void:
+	if active_object == null or not (id is String) or _before.is_empty():
+		return
+	match id.left(3):
+		"loc": _prop_set(id, snappedf(_scrub_start + dx * 0.01, 0.01))
+		"rot": _prop_set(id, snappedf(_scrub_start + dx * 0.5, 0.5))
+		"scl": _prop_set(id, snappedf(_scrub_start + dx * 0.005, 0.005))
+	_refresh_props()
+
+
+func _on_prop_scrub_ended(id: Variant) -> void:
+	if active_object == null or _before.is_empty():
+		return
+	if not is_equal_approx(_prop_get(id), _scrub_start):
+		push_undo("PROPERTIES")
+	_before = {}
 
 
 func _walk(n: Node, trail: Array, out: Array[Dictionary]) -> void:
@@ -614,6 +700,13 @@ func _on_toolbar_tapped(id: Variant) -> void:
 	_refresh_lists()
 
 
+func _on_history_tapped(id: Variant) -> void:
+	if id == "UNDO":
+		undo()
+	else:
+		redo()
+
+
 func _on_proj_tapped(_id: Variant) -> void:
 	orbit.set_ortho(not orbit.ortho)
 	_refresh_lists()
@@ -646,19 +739,30 @@ func _on_elem_tapped(id: Variant) -> void:
 # shows and what its sliders edit; the job knows how to put the selection
 # where the props say (`_tool_apply_props`), from a record of where things
 # were when it started. One job at a time, live until APPLY or CANCEL;
-# anything that moves on from the selection applies it first.
+# anything that moves on from the selection applies it first, and applying
+# is an undo step.
 #
 #   TRANSLATE        X Y Z, world units. A MOVE drag is this tool.
 #   ROTATE           X Y Z, degrees, about the selection's centre
-#   EXTRUDE          AMOUNT along the region's normal   (EDIT only)
-#   EXTRUDE NORMALS  AMOUNT along each vertex's own     (EDIT only)
+#   SCALE            X Y Z, factors, about the selection's centre
+#   EXTRUDE          AMOUNT along the region's normal          (EDIT)
+#   EXTRUDE NORMALS  AMOUNT along each vertex's own            (EDIT)
+#   INSET            THICKNESS in the faces, DEPTH along them  (EDIT, faces)
+#   BEVEL            AMOUNT from each selected edge            (EDIT, edges)
+#
+# The four mesh tools build their topology once, at zero, and the sliders
+# only move vertices (MeshData's two-step jobs).
 
 func tool_available(kind: String) -> bool:
 	match kind:
-		"TRANSLATE", "ROTATE":
+		"TRANSLATE", "ROTATE", "SCALE":
 			return has_moveable()
 		"EXTRUDE", "EXTRUDE NORMALS":
 			return mode == Mode.EDIT and active_object != null and not sel_verts.is_empty()
+		"INSET":
+			return mode == Mode.EDIT and active_object != null and not sel_faces.is_empty()
+		"BEVEL":
+			return mode == Mode.EDIT and active_object != null and not sel_edges.is_empty()
 	return false
 
 
@@ -687,33 +791,53 @@ func tool_start(kind: String = current_tool) -> bool:
 	if not tool_available(kind):
 		return false
 	current_tool = kind
+	var before := _selection_state()
 	var job := {"kind": kind}
-	match kind:
-		"EXTRUDE", "EXTRUDE NORMALS":
-			_tool_backup = active_object.data.copy()
-			_tool_sel_backup = [sel_verts.duplicate(), sel_edges.duplicate(), sel_faces.duplicate()]
-			job.extrude = active_object.data.extrude_begin(sel_verts, sel_edges, sel_faces,
-					kind == "EXTRUDE NORMALS")
-			job.props = [_prop("AMOUNT", 2.0, "", 2)]
-			active_object.rebuild()
-			tool_job = job
-			select_verts(job.extrude.sel_verts)
-		"TRANSLATE":
-			_tool_record_starts(job)
-			job.props = [_prop("X", 4.0, "", 2), _prop("Y", 4.0, "", 2), _prop("Z", 4.0, "", 2)]
-			tool_job = job
-		"ROTATE":
-			_tool_record_starts(job)
-			job.props = [_prop("X", 180.0, "°", 1), _prop("Y", 180.0, "°", 1), _prop("Z", 180.0, "°", 1)]
-			tool_job = job
+	if kind in MESH_TOOLS:
+		var d := active_object.data
+		var backup := d.copy()
+		var mj: Dictionary
+		match kind:
+			"INSET": mj = d.inset_begin(sel_faces)
+			"BEVEL": mj = d.bevel_begin(sel_edges)
+			_: mj = d.extrude_begin(sel_verts, sel_edges, sel_faces, kind == "EXTRUDE NORMALS")
+		if mj.is_empty():
+			active_object.data = backup
+			return false
+		_tool_backup = backup
+		_tool_sel_backup = [sel_verts.duplicate(), sel_edges.duplicate(), sel_faces.duplicate()]
+		job.mesh = mj
+		match kind:
+			"INSET": job.props = [_prop("THICKNESS", 0.0, 1.0, 0.0, "", 2), _prop("DEPTH", -1.0, 1.0, 0.0, "", 2)]
+			"BEVEL": job.props = [_prop("AMOUNT", 0.0, 1.0, 0.0, "", 2)]
+			_: job.props = [_prop("AMOUNT", -2.0, 2.0, 0.0, "", 2)]
+		active_object.rebuild()
+		tool_job = job
+		select_verts(mj.sel_verts)
+	else:
+		_tool_record_starts(job)
+		match kind:
+			"TRANSLATE":
+				job.props = [_prop("X", -4.0, 4.0, 0.0, "", 2), _prop("Y", -4.0, 4.0, 0.0, "", 2),
+						_prop("Z", -4.0, 4.0, 0.0, "", 2)]
+			"ROTATE":
+				job.props = [_prop("X", -180.0, 180.0, 0.0, "°", 1), _prop("Y", -180.0, 180.0, 0.0, "°", 1),
+						_prop("Z", -180.0, 180.0, 0.0, "°", 1)]
+			"SCALE":
+				job.props = [_prop("X", 0.0, 3.0, 1.0, "", 2), _prop("Y", 0.0, 3.0, 1.0, "", 2),
+						_prop("Z", 0.0, 3.0, 1.0, "", 2)]
+		tool_job = job
+	_before = before
 	tool_window.show_tool(kind, tool_job.props)
 	_place_tool_window()
 	_refresh_lists()
 	return true
 
 
-static func _prop(label: String, span: float, unit: String, decimals: int) -> Dictionary:
-	return {"label": label, "value": 0.0, "span": span, "unit": unit, "decimals": decimals}
+## A property: its slider runs `lo`..`hi` and starts at `origin`.
+static func _prop(label: String, lo: float, hi: float, origin: float, unit: String, decimals: int) -> Dictionary:
+	return {"label": label, "value": origin, "min": lo, "max": hi, "origin": origin,
+			"unit": unit, "decimals": decimals}
 
 
 ## Where everything was when a transform started, and the pivot it turns on.
@@ -760,22 +884,31 @@ func tool_set_vector(v: Vector3) -> void:
 	_tool_apply_props()
 
 
+## Increments while snapping is on: 5 degrees, a tenth of scale, a STEP for
+## extrude and moves, a fifth of a STEP for inset and bevel (which want finer
+## widths than a grid).
 func _tool_snap(v: float) -> float:
 	if not (snap_on and snap_targets.INCREMENT):
 		return v
-	return snappedf(v, ROT_STEP if tool_kind() == "ROTATE" else snap_step)
+	match tool_kind():
+		"ROTATE": return snappedf(v, ROT_STEP)
+		"SCALE": return snappedf(v, SCALE_STEP)
+		"INSET", "BEVEL": return snappedf(v, snap_step * 0.2)
+	return snappedf(v, snap_step)
 
 
 func _tool_apply_props() -> void:
 	var vals := tool_values()
-	match tool_kind():
-		"EXTRUDE", "EXTRUDE NORMALS":
-			active_object.data.extrude_set(tool_job.extrude, vals[0])
-			active_object.rebuild()
-		"TRANSLATE":
-			_apply_translate(Vector3(vals[0], vals[1], vals[2]))
-		"ROTATE":
-			_apply_rotate(Vector3(vals[0], vals[1], vals[2]))
+	var kind := tool_kind()
+	if kind in MESH_TOOLS:
+		active_object.data.job_set(tool_job.mesh, vals[0], vals[1] if vals.size() > 1 else 0.0)
+		active_object.rebuild()
+	else:
+		var v := Vector3(vals[0], vals[1], vals[2])
+		match kind:
+			"TRANSLATE": _apply_translate(v)
+			"ROTATE": _apply_about(Basis.from_euler(v * (PI / 180.0)))
+			"SCALE": _apply_about(Basis.from_scale(v.clamp(Vector3.ONE * 0.001, Vector3.ONE * 1000.0)))
 	tool_window.set_values(vals)
 
 
@@ -793,10 +926,10 @@ func _apply_translate(delta: Vector3) -> void:
 	o.rebuild()
 
 
-func _apply_rotate(degrees: Vector3) -> void:
-	var r := Basis.from_euler(degrees * (PI / 180.0))
+## Rotate or scale about the pivot, in world axes.
+func _apply_about(b: Basis) -> void:
 	var pivot: Vector3 = tool_job.pivot
-	var about := Transform3D(r, pivot - r * pivot)
+	var about := Transform3D(b, pivot - b * pivot)
 	if mode == Mode.OBJECT:
 		for o in _move_obj_start:
 			if is_instance_valid(o):
@@ -810,9 +943,46 @@ func _apply_rotate(degrees: Vector3) -> void:
 	o.rebuild()
 
 
+func _tool_changed() -> bool:
+	for p in tool_job.get("props", []):
+		if not is_equal_approx(p.value, p.origin):
+			return true
+	return false
+
+
+## Keep what the tool did, as an undo step.
 func tool_apply() -> void:
 	if not tool_live():
 		return
+	var changed := _tool_changed()
+	var kind := tool_kind()
+	_tool_close()
+	if changed:
+		push_undo(kind)
+	_before = {}
+
+
+func tool_cancel() -> void:
+	if not tool_live():
+		return
+	if tool_kind() in MESH_TOOLS:
+		active_object.data = _tool_backup
+		active_object.rebuild()
+		sel_verts = _tool_sel_backup[0]
+		sel_edges = _tool_sel_backup[1]
+		sel_faces = _tool_sel_backup[2]
+	elif mode == Mode.OBJECT:
+		for o in _move_obj_start:
+			if is_instance_valid(o):
+				o.global_transform = _move_obj_start[o]
+	else:
+		active_object.data.verts = _move_vert_start.duplicate()
+		active_object.rebuild()
+	_tool_close()
+	_before = {}
+
+
+func _tool_close() -> void:
 	tool_job = {}
 	_tool_backup = null
 	_move_obj_start.clear()
@@ -820,27 +990,6 @@ func tool_apply() -> void:
 	snap_hit = {}
 	tool_window.visible = false
 	_refresh_lists()
-
-
-func tool_cancel() -> void:
-	if not tool_live():
-		return
-	match tool_kind():
-		"EXTRUDE", "EXTRUDE NORMALS":
-			active_object.data = _tool_backup
-			active_object.rebuild()
-			sel_verts = _tool_sel_backup[0]
-			sel_edges = _tool_sel_backup[1]
-			sel_faces = _tool_sel_backup[2]
-		"TRANSLATE", "ROTATE":
-			if mode == Mode.OBJECT:
-				for o in _move_obj_start:
-					if is_instance_valid(o):
-						o.global_transform = _move_obj_start[o]
-			else:
-				active_object.data.verts = _move_vert_start.duplicate()
-				active_object.rebuild()
-	tool_apply()
 
 
 ## Anything that moves on from the selection applies a live tool first.
@@ -855,11 +1004,12 @@ func _place_tool_window() -> void:
 			view_rect.end.y - 30.0 - tool_window.size.y)
 
 
-## A drag in the view with TOOL as the pointer: start the current tool if
-## none is running, then the drag drives it. EXTRUDE's amount and ROTATE's
-## angle follow the pointer sideways, scaled to the camera's distance so a
-## hand's width means about the same at any zoom; ROTATE turns about the
-## world axis the camera looks down most. TRANSLATE is the MOVE drag.
+## A drag in the view with a tool as the pointer: start it if none is
+## running, then the drag drives it. Lengths and angles follow the pointer
+## sideways, scaled to the camera's distance so a hand's width means about
+## the same at any zoom; ROTATE turns about the world axis the camera looks
+## down most; SCALE is uniform, by how far the pointer is from the pivot
+## against where it started. TRANSLATE is the MOVE drag.
 func _tool_drag_begin(origin: Vector2) -> bool:
 	if not tool_live() and not tool_start(current_tool):
 		return false
@@ -869,20 +1019,148 @@ func _tool_drag_begin(origin: Vector2) -> bool:
 		_move_plane = Plane(camera().global_basis.z, _move_pivot)
 		var prior := Vector3(_tool_drag_from[0], _tool_drag_from[1], _tool_drag_from[2])
 		_move_start = _plane_point(origin, _move_pivot) - prior
+	elif tool_kind() == "SCALE":
+		_tool_drag_pivot = camera().unproject_position(_move_pivot)
 	return true
 
 
 func _tool_drag_update(pos: Vector2) -> void:
 	var dx := pos.x - _tool_drag_origin.x
+	var length := dx * orbit.distance * TOOL_UNITS_PER_PX
 	match tool_kind():
-		"EXTRUDE", "EXTRUDE NORMALS":
-			tool_set(0, _tool_drag_from[0] + dx * orbit.distance * TOOL_UNITS_PER_PX)
+		"EXTRUDE", "EXTRUDE NORMALS", "BEVEL":
+			tool_set(0, _tool_drag_from[0] + length)
+		"INSET":
+			tool_set(0, _tool_drag_from[0] + length * 0.5)
 		"ROTATE":
 			var fwd := camera().global_basis.z.abs()
 			var axis := 0 if fwd.x >= fwd.y and fwd.x >= fwd.z else (1 if fwd.y >= fwd.z else 2)
 			tool_set(axis, _tool_drag_from[axis] + dx * ROT_DEG_PER_PX)
+		"SCALE":
+			var r0 := maxf(_tool_drag_origin.distance_to(_tool_drag_pivot), 20.0)
+			var k := pos.distance_to(_tool_drag_pivot) / r0
+			for i in 3:
+				tool_job.props[i].value = _tool_snap(_tool_drag_from[i] * k)
+			_tool_apply_props()
 		"TRANSLATE":
 			move_update(pos)
+
+
+# --- history -------------------------------------------------------------------
+#
+# Undo goes back one snapshot; with a tool live it cancels the tool instead.
+# Two fingers tapped together in the view are UNDO, three are REDO (the
+# tablet painting apps' gesture); the header has both, and Ctrl+Z works.
+
+func can_undo() -> bool:
+	return tool_live() or history_index > 0
+
+
+func can_redo() -> bool:
+	return not tool_live() and history_index < history.size() - 1
+
+
+## Record the scene as it is now, after a change, as one undo step.
+func push_undo(label: String) -> void:
+	# The step before keeps the selection the user had going into this one.
+	if not _before.is_empty() and history_index >= 0:
+		history[history_index].merge(_before, true)
+	history.resize(history_index + 1)
+	var snap := _snapshot()
+	snap.label = label
+	history.append(snap)
+	while history.size() > HISTORY_MAX:
+		history.pop_front()
+	history_index = history.size() - 1
+	_before = {}
+	if history_bar != null:
+		_refresh_lists()
+
+
+func undo() -> void:
+	if tool_live():
+		tool_cancel()
+		return
+	if history_index <= 0:
+		return
+	history_index -= 1
+	_restore(history[history_index])
+
+
+func redo() -> void:
+	if tool_live() or history_index >= history.size() - 1:
+		return
+	history_index += 1
+	_restore(history[history_index])
+
+
+func history_label() -> String:
+	return history[history_index].label if history_index >= 0 else ""
+
+
+## Note the selection now, for the step a change is about to make.
+func _mark_before() -> void:
+	_before = _selection_state()
+
+
+func _selection_state() -> Dictionary:
+	var index := {}
+	var objs := objects()
+	for i in objs.size():
+		index[objs[i]] = i
+	var sel := []
+	for o in sel_objects:
+		if index.has(o):
+			sel.append(index[o])
+	return {"sel": sel, "active": index.get(active_object, -1), "mode": mode, "elem": elem,
+			"sv": sel_verts.duplicate(), "se": sel_edges.duplicate(), "sf": sel_faces.duplicate()}
+
+
+func _snapshot() -> Dictionary:
+	var objs := objects()
+	var index := {}
+	for i in objs.size():
+		index[objs[i]] = i
+	var recs := []
+	for o in objs:
+		recs.append({"name": String(o.name), "group": o.is_group, "parent": index.get(o.get_parent(), -1),
+				"xf": o.transform, "data": o.data.copy()})
+	var snap := _selection_state()
+	snap.objects = recs
+	return snap
+
+
+func _restore(snap: Dictionary) -> void:
+	hover_object = null
+	hover_kind = -1
+	_move_obj_start.clear()
+	_moving_set.clear()
+	for c in world_root.get_children():
+		if c is SceneObject:
+			world_root.remove_child(c)
+			c.queue_free()
+	var made: Array[SceneObject] = []
+	for r in snap.objects:
+		var o: SceneObject
+		if r.group:
+			o = SceneObject.create_group(r.name)
+		else:
+			o = SceneObject.create(r.name, r.data.copy())
+		var parent: Node = world_root if r.parent < 0 else made[r.parent]
+		parent.add_child(o)
+		o.name = r.name
+		o.transform = r.xf
+		made.append(o)
+	sel_objects.clear()
+	for i in snap.sel:
+		sel_objects.append(made[i])
+	active_object = made[snap.active] if snap.active >= 0 else null
+	elem = snap.elem
+	mode = snap.mode if active_object != null and active_object.has_mesh() else Mode.OBJECT
+	sel_verts = snap.sv.duplicate()
+	sel_edges = snap.se.duplicate()
+	sel_faces = snap.sf.duplicate()
+	_refresh_lists()
 
 
 # --- commands ------------------------------------------------------------------
@@ -896,10 +1174,12 @@ func add_primitive(kind: String) -> SceneObject:
 		"SPHERE": data = MeshData.make_sphere()
 		_: return null
 	_tool_finish()
+	_mark_before()
 	var o := SceneObject.create(_unique_name(kind.capitalize()), data)
 	world_root.add_child(o)
 	mode = Mode.OBJECT
 	select_object(o)
+	push_undo("ADD " + kind)
 	return o
 
 
@@ -908,6 +1188,7 @@ func add_primitive(kind: String) -> SceneObject:
 ## With nothing selected it is an empty group at the origin.
 func add_group() -> SceneObject:
 	_tool_finish()
+	_mark_before()
 	var g := SceneObject.create_group(_unique_name("Group"))
 	var roots := _move_roots() if mode == Mode.OBJECT else []
 	if roots.is_empty():
@@ -925,6 +1206,7 @@ func add_group() -> SceneObject:
 			o.reparent(g, true)
 	mode = Mode.OBJECT
 	select_object(g)
+	push_undo("GROUP")
 	return g
 
 
@@ -948,8 +1230,9 @@ func reparent_object(o: SceneObject, target: Node) -> bool:
 	if o.get_parent() == target:
 		return false
 	_tool_finish()
+	_mark_before()
 	o.reparent(target, true)
-	_refresh_lists()
+	push_undo("PARENT")
 	return true
 
 
@@ -995,6 +1278,11 @@ func set_elem(e: Elem) -> void:
 
 func delete_selected() -> void:
 	_tool_finish()
+	if mode == Mode.OBJECT and sel_objects.is_empty():
+		return
+	if mode == Mode.EDIT and (active_object == null or sel_verts.is_empty()):
+		return
+	_mark_before()
 	if mode == Mode.OBJECT:
 		var doomed := sel_objects.duplicate()
 		clear_object_selection()
@@ -1013,7 +1301,7 @@ func delete_selected() -> void:
 		active_object.data.delete_verts(sel_verts)
 		active_object.rebuild()
 		_clear_elems()
-	_refresh_lists()
+	push_undo("DELETE")
 
 
 # --- element selection ---------------------------------------------------------
@@ -1433,13 +1721,100 @@ func _unhandled_input(event: InputEvent) -> void:
 		_pen_button(click)
 	elif motion != null:
 		_pen_motion(motion)
+	elif event is InputEventKey and event.pressed and not event.echo:
+		if _key(event):
+			get_viewport().set_input_as_handled()
+
+
+## Blender's keys, for a keyboard on the tablet or a desk.
+func _key(k: InputEventKey) -> bool:
+	var ctrl := k.ctrl_pressed or k.meta_pressed
+	match k.keycode:
+		KEY_Z:
+			if ctrl:
+				if k.shift_pressed:
+					redo()
+				else:
+					undo()
+				return true
+		KEY_Y:
+			if ctrl:
+				redo()
+				return true
+		KEY_TAB:
+			set_mode(Mode.EDIT if mode == Mode.OBJECT else Mode.OBJECT)
+			return true
+		KEY_1, KEY_2, KEY_3:
+			if mode == Mode.EDIT and not ctrl:
+				set_elem([Elem.VERT, Elem.EDGE, Elem.FACE][k.keycode - KEY_1])
+				return true
+		KEY_G:
+			_on_toolbar_tapped("MOVE")
+			if has_moveable():
+				tool_start("TRANSLATE")
+			return true
+		KEY_R:
+			_on_toolbar_tapped("ROTATE")
+			return true
+		KEY_S:
+			_on_toolbar_tapped("SCALE")
+			return true
+		KEY_E:
+			if mode == Mode.EDIT:
+				_on_toolbar_tapped("EXTRUDE")
+				return true
+		KEY_I:
+			if mode == Mode.EDIT:
+				_on_toolbar_tapped("INSET")
+				return true
+		KEY_B:
+			if ctrl and mode == Mode.EDIT:
+				_on_toolbar_tapped("BEVEL")
+				return true
+		KEY_X, KEY_DELETE:
+			delete_selected()
+			return true
+		KEY_A:
+			if k.shift_pressed:
+				open_popover("ADD")
+				return true
+		KEY_ENTER, KEY_KP_ENTER:
+			tool_apply()
+			return true
+		KEY_ESCAPE:
+			if tool_live():
+				tool_cancel()
+			else:
+				close_popover()
+			return true
+		KEY_KP_1:
+			orbit.set_view("BACK" if ctrl else "FRONT", false)
+			_refresh_lists()
+			return true
+		KEY_KP_3:
+			orbit.set_view("LEFT" if ctrl else "RIGHT", false)
+			_refresh_lists()
+			return true
+		KEY_KP_7:
+			orbit.set_view("BOTTOM" if ctrl else "TOP", false)
+			_refresh_lists()
+			return true
+		KEY_KP_5:
+			_on_proj_tapped(null)
+			return true
+	return false
 
 
 func _touch(t: InputEventScreenTouch) -> void:
 	if t.pressed:
 		if not view_rect.has_point(t.position) and _touches.is_empty():
 			return
+		if _touches.is_empty():
+			_gesture_t0 = Time.get_ticks_msec()
+			_gesture_max = 0
+			_gesture_moved = false
 		_touches[t.index] = {"pos": t.position, "start": t.position, "time": 0.0, "cancelled": false}
+		_gesture_max = maxi(_gesture_max, _touches.size())
 		if _touches.size() == 2:
 			for k in _touches:
 				_touches[k].cancelled = true
@@ -1455,6 +1830,14 @@ func _touch(t: InputEventScreenTouch) -> void:
 		return
 	var info: Dictionary = _touches[t.index]
 	_touches.erase(t.index)
+	if _touches.is_empty() and _gesture_max >= 2 and not _gesture_moved \
+			and Time.get_ticks_msec() - _gesture_t0 <= GESTURE_TAP_MS:
+		# Two fingers tapped together: undo. Three: redo.
+		if _gesture_max == 2:
+			undo()
+		elif _gesture_max == 3:
+			redo()
+		return
 	if _finger_tooling and _touches.is_empty():
 		_finger_tooling = false
 		return
@@ -1477,6 +1860,8 @@ func _touch_drag(d: InputEventScreenDrag) -> void:
 	var info: Dictionary = _touches[d.index]
 	var prev: Vector2 = info.pos
 	info.pos = d.position
+	if info.pos.distance_to(info.start) > TAP_SLOP * 1.5:
+		_gesture_moved = true
 	if _touches.size() == 1:
 		if info.cancelled:
 			return

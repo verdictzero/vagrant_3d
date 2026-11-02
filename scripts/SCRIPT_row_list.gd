@@ -11,7 +11,9 @@ extends Control
 ##   parent), disabled, heading (a section label, not a row), value (text at
 ##   the right), value_clock (the value is a number: clock face), on (true /
 ##   false draws a lit / unlit mark at the right), lit (a bar toggle that is
-##   on), inert (shown, never pressed: a readout row).
+##   on), inert (shown, never pressed: a readout row), scrub (a number you
+##   drag sideways to change, the way Blender's fields work: the list says
+##   how far, the owner decides what that means).
 ##
 ## A list taller than its box scrolls: a drag up or down the rows, the bar
 ## at its right edge, or the wheel. A sideways drag (or a hold) still lifts
@@ -22,6 +24,9 @@ const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
 
 signal tapped(id: Variant)
 signal drag_dropped(from_id: Variant, to_id: Variant)   # to_id null: dropped on nothing
+signal scrub_started(id: Variant)
+signal scrubbed(id: Variant, dx: float)                 # pixels from where it started
+signal scrub_ended(id: Variant)
 
 @export var horizontal := false
 @export var draggable := false
@@ -46,6 +51,7 @@ var _press_pos := Vector2.ZERO
 var _press_time := 0.0
 var _press_pointer := -1            # touch index, or -1 for the pen/mouse
 var _dragging := false
+var _scrubbing := false
 var _scrolling := false
 var _barring := false
 var _scroll_from := 0.0
@@ -192,20 +198,20 @@ func _gui_input(event: InputEvent) -> void:
 	elif click != null and click.button_index == MOUSE_BUTTON_LEFT:
 		if click.pressed:
 			_press(click.position, -1)
-		elif _press_pointer == -1 and (_press_id != null or _scrolling or _barring):
+		elif _press_pointer == -1 and (_press_id != null or _scrolling or _barring or _scrubbing):
 			_release(click.position)
 		accept_event()
 	elif click != null and scrollable() and click.pressed \
 			and click.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
 		set_scroll(scroll + (row_h if click.button_index == MOUSE_BUTTON_WHEEL_DOWN else -row_h))
 		accept_event()
-	elif motion != null and _press_pointer == -1 and (_press_id != null or _scrolling or _barring):
+	elif motion != null and _press_pointer == -1 and (_press_id != null or _scrolling or _barring or _scrubbing):
 		_move(motion.position)
 		accept_event()
 
 
 func _press(pos: Vector2, pointer: int) -> void:
-	if _press_id != null or _scrolling or _barring:
+	if _press_id != null or _scrolling or _barring or _scrubbing:
 		return
 	_press_pos = pos
 	_press_time = 0.0
@@ -233,8 +239,18 @@ func _move(pos: Vector2) -> void:
 	if _scrolling:
 		set_scroll(_scroll_from - (pos.y - _press_pos.y))
 		return
+	if _scrubbing:
+		scrubbed.emit(_press_id, pos.x - _press_pos.x)
+		return
 	if not _dragging and pos.distance_to(_press_pos) > SLOP:
 		var d := pos - _press_pos
+		var i := index_of(_press_id)
+		if i >= 0 and items[i].get("scrub", false) and absf(d.x) > absf(d.y):
+			_scrubbing = true
+			scrub_started.emit(_press_id)
+			scrubbed.emit(_press_id, d.x)
+			queue_redraw()
+			return
 		if draggable and absf(d.x) > absf(d.y):
 			_dragging = true
 		elif scrollable():
@@ -255,7 +271,10 @@ func _release(pos: Vector2) -> void:
 	var id: Variant = _press_id
 	_press_id = null
 	_press_pointer = -1
-	if _scrolling or _barring:
+	if _scrubbing:
+		_scrubbing = false
+		scrub_ended.emit(id)
+	elif _scrolling or _barring:
 		_scrolling = false
 		_barring = false
 	elif _dragging:
@@ -312,8 +331,12 @@ func _draw() -> void:
 		var disabled: bool = it.get("disabled", false)
 		var col := T.COL_READY
 		var f := font
+		var scrubbing_this: bool = _scrubbing and it.id == _press_id
 		if disabled:
 			col = T.COL_DIM
+		elif scrubbing_this:
+			col = T.COL_CURSOR
+			f = bold
 		elif it.id == active:
 			col = T.COL_CURSOR
 			f = bold
@@ -349,8 +372,15 @@ func _draw() -> void:
 			var vf: Font = Fonts.clock() if it.get("value_clock", false) else font
 			var vs: int = font_size + 2 if it.get("value_clock", false) else font_size
 			var vw := vf.get_string_size(it.value, HORIZONTAL_ALIGNMENT_LEFT, -1, vs).x
+			var vcol := T.COL_DIM if disabled else (T.COL_CURSOR if scrubbing_this else T.COL_NAME)
 			draw_string(vf, Vector2(rx - vw, r.position.y + _baseline(vf, vs, r.size.y)), it.value,
-					HORIZONTAL_ALIGNMENT_LEFT, -1, vs, T.COL_DIM if disabled else T.COL_NAME)
+					HORIZONTAL_ALIGNMENT_LEFT, -1, vs, vcol)
+			if it.get("scrub", false):
+				# The field's tell: small carets either side of the number.
+				var my := r.get_center().y
+				var lx := rx - vw - 10.0
+				draw_line(Vector2(lx + 4.0, my - 4.0), Vector2(lx, my), T.COL_WAIT, 1.0)
+				draw_line(Vector2(lx, my), Vector2(lx + 4.0, my + 4.0), T.COL_WAIT, 1.0)
 		elif it.has("on"):
 			var m := Rect2(rx - MARK, r.get_center().y - MARK * 0.5, MARK, MARK)
 			if it.on:

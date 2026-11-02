@@ -306,12 +306,71 @@ func face_runs(f: int, a: int, b: int) -> bool:
 	return false
 
 
-# --- extrude -------------------------------------------------------------------
+# --- live operations -------------------------------------------------------------
 #
-# Two steps, so a slider can pull the result live: `extrude_begin` builds the
-# new topology at zero offset and says which vertices move and which way;
-# `extrude_set` puts them at an offset. Cancel is the caller's: it keeps a
-# copy() from before.
+# Every operation that changes topology runs in two steps, so a slider can
+# pull the result live: `*_begin` builds the new topology at zero and returns
+# a JOB saying which vertices move and which way; `job_set` puts them where
+# an amount says. Positions are linear in the amount (base + dir * amount,
+# plus dir2 * a second amount where the tool has one), clamped per vertex by
+# `limit` where running past it would fold the mesh. Cancel is the caller's:
+# it keeps a copy() from before.
+#
+#   job = { moving, base, dir, dir2?, limit?, sel_verts }
+
+func job_set(job: Dictionary, amount: float, amount2: float = 0.0) -> void:
+	var moving: PackedInt32Array = job.moving
+	var base: PackedVector3Array = job.base
+	var dir: PackedVector3Array = job.dir
+	var dir2: PackedVector3Array = job.get("dir2", PackedVector3Array())
+	var limit: PackedFloat32Array = job.get("limit", PackedFloat32Array())
+	for i in moving.size():
+		var a := amount
+		if not limit.is_empty():
+			a = clampf(a, -limit[i], limit[i])
+		var p := base[i] + dir[i] * a
+		if not dir2.is_empty():
+			p += dir2[i] * amount2
+		verts[moving[i]] = p
+
+
+## Drop vertices no face or edge uses; returns old index -> new (-1 gone).
+func compact() -> PackedInt32Array:
+	var used := {}
+	for f in faces:
+		for i in f:
+			used[i] = true
+	for e in edges:
+		used[e.x] = true
+		used[e.y] = true
+	var remap := PackedInt32Array()
+	remap.resize(verts.size())
+	var kept := PackedVector3Array()
+	for i in verts.size():
+		if used.has(i):
+			remap[i] = kept.size()
+			kept.append(verts[i])
+		else:
+			remap[i] = -1
+	if kept.size() == verts.size():
+		return remap
+	var old_faces := faces
+	var old_edges := edges
+	verts = kept
+	faces = []
+	edges = []
+	_edge_index = {}
+	for f in old_faces:
+		var nf := PackedInt32Array()
+		for i in f:
+			nf.append(remap[i])
+		add_face(nf)
+	for e in old_edges:
+		_add_edge(remap[e.x], remap[e.y])
+	return remap
+
+
+# --- extrude -------------------------------------------------------------------
 #
 # What gets extruded follows the selection the way Blender picks: whole
 # faces when any are selected (a region: its rim grows walls and its inside
@@ -331,16 +390,13 @@ func extrude_begin(sel_v: Dictionary, sel_e: Dictionary, sel_f: Dictionary,
 
 
 func extrude_set(job: Dictionary, amount: float) -> void:
-	var moving: PackedInt32Array = job.moving
-	var base: PackedVector3Array = job.base
-	var dir: PackedVector3Array = job.dir
-	for i in moving.size():
-		verts[moving[i]] = base[i] + dir[i] * amount
+	job_set(job, amount)
 
 
-func _extrude_faces(sel_f: Dictionary, along_normals: bool) -> Dictionary:
-	# Rim edges: in exactly one selected face. Rim vertices are duplicated so
-	# the walls have something to stand on; inside vertices move in place.
+## The region's rim: edges in exactly one selected face, [a, b] as that face
+## runs them. Shared by extrude and inset, which build the same topology and
+## differ only in which way the new ring moves.
+func _region(sel_f: Dictionary) -> Dictionary:
 	var in_region := {}
 	var rim: Array = []          # [a, b] as the selected face runs them
 	var region_verts := {}
@@ -363,17 +419,15 @@ func _extrude_faces(sel_f: Dictionary, along_normals: bool) -> Dictionary:
 	for e in rim:
 		rim_verts[e[0]] = true
 		rim_verts[e[1]] = true
-	# Directions are taken before anything moves or is renumbered.
-	var region_n := Vector3.ZERO
-	for f in sel_f:
-		region_n += face_normal_raw(f)
-	region_n = region_n.normalized() if region_n.length_squared() > 0.0 else Vector3.UP
-	var dirs := {}
-	for v in region_verts:
-		dirs[v] = vertex_normal(v, sel_f) if along_normals else region_n
+	return {"rim": rim, "rim_verts": rim_verts, "region_verts": region_verts}
+
+
+## Duplicate the rim, move the region's faces onto the copy, and wall the gap:
+## returns old vertex -> the vertex the region now uses.
+func _region_split(sel_f: Dictionary, reg: Dictionary) -> Dictionary:
 	var map := {}
-	for v in region_verts:
-		map[v] = add_vert(verts[v]) if rim_verts.has(v) else v
+	for v in reg.region_verts:
+		map[v] = add_vert(verts[v]) if reg.rim_verts.has(v) else v
 	var new_faces: Array[PackedInt32Array] = []
 	for f in sel_f:
 		var nf := PackedInt32Array()
@@ -383,8 +437,24 @@ func _extrude_faces(sel_f: Dictionary, along_normals: bool) -> Dictionary:
 	remove_faces(sel_f)
 	for nf in new_faces:
 		add_face(nf)
-	for e in rim:
+	for e in reg.rim:
 		add_face(PackedInt32Array([e[0], e[1], map[e[1]], map[e[0]]]))
+	return map
+
+
+func _extrude_faces(sel_f: Dictionary, along_normals: bool) -> Dictionary:
+	# Rim vertices are duplicated so the walls have something to stand on;
+	# inside vertices move in place.
+	var reg := _region(sel_f)
+	# Directions are taken before anything moves or is renumbered.
+	var region_n := Vector3.ZERO
+	for f in sel_f:
+		region_n += face_normal_raw(f)
+	region_n = region_n.normalized() if region_n.length_squared() > 0.0 else Vector3.UP
+	var dirs := {}
+	for v in reg.region_verts:
+		dirs[v] = vertex_normal(v, sel_f) if along_normals else region_n
+	var map := _region_split(sel_f, reg)
 	return _job(map, dirs)
 
 
@@ -442,3 +512,262 @@ func _job(map: Dictionary, dirs: Dictionary) -> Dictionary:
 		dir.append(dirs[v])
 		sel[map[v]] = true
 	return {"moving": moving, "base": base, "dir": dir, "sel_verts": sel}
+
+
+# --- inset -----------------------------------------------------------------------
+#
+# Faces only, as a region (Blender's default): the rim is copied and the copy
+# slides inward in the faces' plane, so a ring of walls appears around the
+# region, flat at first. THICKNESS is the ring's width, measured square to
+# each rim edge; DEPTH lifts (or sinks) the inner region along its normals.
+
+func inset_begin(sel_f: Dictionary) -> Dictionary:
+	if sel_f.is_empty():
+		return {}
+	var reg := _region(sel_f)
+	# Which face each rim edge belongs to, for its plane.
+	var rim_face := {}
+	for f in sel_f:
+		var idx := faces[f]
+		for i in idx.size():
+			rim_face[Vector2i(idx[i], idx[(i + 1) % idx.size()])] = f
+	var inward := {}   # rim vertex -> Array of inward unit vectors, one per rim edge
+	for e in reg.rim:
+		var a: int = e[0]
+		var b: int = e[1]
+		var n := face_normal(rim_face[Vector2i(a, b)])
+		var i := n.cross(verts[b] - verts[a]).normalized()
+		for v in [a, b]:
+			if not inward.has(v):
+				inward[v] = []
+			inward[v].append(i)
+	var dirs := {}
+	var dirs2 := {}
+	for v in reg.region_verts:
+		dirs2[v] = vertex_normal(v, sel_f)
+		if not inward.has(v):
+			dirs[v] = Vector3.ZERO
+			continue
+		var list: Array = inward[v]
+		var sum := Vector3.ZERO
+		for i in list:
+			sum += i
+		if sum.length_squared() < 1e-10:
+			dirs[v] = Vector3.ZERO
+			continue
+		var d := sum.normalized()
+		# Two edges meeting at an angle: go further along the bisector so the
+		# ring is THICKNESS wide square to both.
+		var k := 1.0
+		if list.size() == 2:
+			k = maxf(d.dot(list[0]), 0.2)
+		dirs[v] = d / k
+	var map := _region_split(sel_f, reg)
+	var job := _job(map, dirs)
+	var dir2 := PackedVector3Array()
+	for v in map:
+		dir2.append(dirs2[v])
+	job.dir2 = dir2
+	return job
+
+
+# --- bevel -----------------------------------------------------------------------
+#
+# Edges, one segment. Each selected edge (it must have a face on both sides)
+# becomes a strip; AMOUNT is how far its new edges sit from the old one,
+# square to it, in each face. Around every vertex of a selected edge, each
+# face corner is rebuilt from which of its two edges are selected:
+#
+#   both      a new corner point inside the face, AMOUNT from both edges
+#   one       a point sliding along the other edge, AMOUNT from the selected one
+#   neither   the slide points its edges already have (from the faces across
+#             them), with the old vertex kept between only if one is missing
+#
+# The strips are quads between the two faces' new edges, and whatever hole
+# that leaves at a vertex (the corner of a cube with all three edges bevelled
+# leaves a triangle) is filled with a face. Unused old vertices go.
+
+func bevel_begin(sel_e: Dictionary) -> Dictionary:
+	var efm := edge_face_map()
+	var sel := {}
+	for e in sel_e:
+		var key: Vector2i = edges[e]
+		if efm[key].size() == 2:
+			sel[key] = true
+	if sel.is_empty():
+		return {}
+	var bev := {}
+	for k in sel:
+		bev[k.x] = true
+		bev[k.y] = true
+	var face_n: Array[Vector3] = []
+	for f in faces.size():
+		face_n.append(face_normal(f))
+	var is_sel := func(a: int, b: int) -> bool:
+		return sel.has(Vector2i(mini(a, b), maxi(a, b)))
+
+	# Pass 1: which edges get a slide point at which end, and how far it
+	# travels per unit of AMOUNT (1 / sin of its angle to the selected edge).
+	var slide_rate := {}   # Vector2i(v, b): [sum, count]
+	for f in faces.size():
+		var idx := faces[f]
+		var n := idx.size()
+		for i in n:
+			var v := idx[i]
+			if not bev.has(v):
+				continue
+			var a := idx[(i - 1 + n) % n]
+			var b := idx[(i + 1) % n]
+			var s_in: bool = is_sel.call(a, v)
+			var s_out: bool = is_sel.call(v, b)
+			if s_in and not s_out:
+				_bevel_rate(slide_rate, v, b, a)
+			elif s_out and not s_in:
+				_bevel_rate(slide_rate, v, a, b)
+
+	var moving := PackedInt32Array()
+	var base := PackedVector3Array()
+	var dir := PackedVector3Array()
+	var limit := PackedFloat32Array()
+	var slide := {}        # Vector2i(v, b) -> new vertex
+	for k in slide_rate:
+		var v: int = k.x
+		var b: int = k.y
+		var d := verts[b] - verts[v]
+		var length := d.length()
+		var rate: float = slide_rate[k][0] / slide_rate[k][1]
+		var ni := add_vert(verts[v])
+		slide[k] = ni
+		moving.append(ni)
+		base.append(verts[v])
+		dir.append(d / length * rate)
+		limit.append(length * (0.49 if bev.has(b) else 0.98) / rate)
+
+	# Pass 2: every face, rebuilt corner by corner.
+	var corner := {}       # Vector2i(f, v) -> the vertex face f now has at v
+	var new_faces: Array[PackedInt32Array] = []
+	for f in faces.size():
+		var idx := faces[f]
+		var n := idx.size()
+		var seq := PackedInt32Array()
+		for i in n:
+			var v := idx[i]
+			if not bev.has(v):
+				seq.append(v)
+				continue
+			var a := idx[(i - 1 + n) % n]
+			var b := idx[(i + 1) % n]
+			var s_in: bool = is_sel.call(a, v)
+			var s_out: bool = is_sel.call(v, b)
+			if s_in and s_out:
+				var i1 := face_n[f].cross(verts[v] - verts[a]).normalized()
+				var i2 := face_n[f].cross(verts[b] - verts[v]).normalized()
+				var dd := i1 + i2
+				dd = dd.normalized() if dd.length_squared() > 1e-10 else i1
+				var k := maxf(dd.dot(i1), 0.2)
+				var ni := add_vert(verts[v])
+				moving.append(ni)
+				base.append(verts[v])
+				dir.append(dd / k)
+				limit.append(minf((verts[a] - verts[v]).length(), (verts[b] - verts[v]).length()) * 0.49)
+				corner[Vector2i(f, v)] = ni
+				seq.append(ni)
+			elif s_in:
+				corner[Vector2i(f, v)] = slide[Vector2i(v, b)]
+				seq.append(slide[Vector2i(v, b)])
+			elif s_out:
+				corner[Vector2i(f, v)] = slide[Vector2i(v, a)]
+				seq.append(slide[Vector2i(v, a)])
+			else:
+				var has_in := slide.has(Vector2i(v, a))
+				var has_out := slide.has(Vector2i(v, b))
+				if has_in:
+					seq.append(slide[Vector2i(v, a)])
+				if not (has_in and has_out):
+					seq.append(v)
+				if has_out:
+					seq.append(slide[Vector2i(v, b)])
+		new_faces.append(seq)
+
+	# The strips, one per selected edge, wound against both faces' new edges.
+	for k in sel:
+		var fs: Array = efm[k]
+		var fa: int = fs[0]
+		var fb: int = fs[1]
+		var x: int = k.x
+		var y: int = k.y
+		if not face_runs(fa, x, y):
+			var t := fa
+			fa = fb
+			fb = t
+		new_faces.append(PackedInt32Array([corner[Vector2i(fa, y)], corner[Vector2i(fa, x)],
+				corner[Vector2i(fb, x)], corner[Vector2i(fb, y)]]))
+
+	faces = []
+	edges = []
+	_edge_index = {}
+	for nf in new_faces:
+		add_face(nf)
+	_bevel_fill_holes(bev, verts.size() - moving.size())
+
+	var remap := compact()
+	var sel_out := {}
+	var keep := PackedInt32Array()
+	var keep_base := PackedVector3Array()
+	var keep_dir := PackedVector3Array()
+	var keep_limit := PackedFloat32Array()
+	for i in moving.size():
+		var ni: int = remap[moving[i]]
+		if ni < 0:
+			continue
+		keep.append(ni)
+		keep_base.append(base[i])
+		keep_dir.append(dir[i])
+		keep_limit.append(limit[i])
+		sel_out[ni] = true
+	return {"moving": keep, "base": keep_base, "dir": keep_dir, "limit": keep_limit, "sel_verts": sel_out}
+
+
+func _bevel_rate(rate: Dictionary, v: int, along: int, from_sel: int) -> void:
+	var d := (verts[along] - verts[v]).normalized()
+	var u := (verts[from_sel] - verts[v]).normalized()
+	var r := 1.0 / maxf(d.cross(u).length(), 0.1)
+	var k := Vector2i(v, along)
+	if not rate.has(k):
+		rate[k] = [0.0, 0]
+	rate[k][0] += r
+	rate[k][1] += 1
+
+
+## Fill the holes a bevel leaves: boundary loops whose every vertex is new
+## (index >= `first_new`) or a bevelled vertex. A mesh's own open border has
+## other vertices on it, so it is never filled.
+func _bevel_fill_holes(bev: Dictionary, first_new: int) -> void:
+	var directed := {}
+	for f in faces:
+		for i in f.size():
+			directed[Vector2i(f[i], f[(i + 1) % f.size()])] = true
+	var hole_next := {}
+	for e in directed:
+		if directed.has(Vector2i(e.y, e.x)):
+			continue
+		var ok_a: bool = e.x >= first_new or bev.has(e.x)
+		var ok_b: bool = e.y >= first_new or bev.has(e.y)
+		if ok_a and ok_b:
+			hole_next[e.y] = e.x
+	var seen := {}
+	for start in hole_next.keys():
+		if seen.has(start):
+			continue
+		var loop := PackedInt32Array()
+		var cur: int = start
+		var closed := false
+		while hole_next.has(cur) and not seen.has(cur):
+			seen[cur] = true
+			loop.append(cur)
+			cur = hole_next[cur]
+			if cur == start:
+				closed = true
+				break
+		if closed and loop.size() >= 3:
+			add_face(loop)

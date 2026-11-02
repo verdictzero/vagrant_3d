@@ -20,6 +20,8 @@ func _initialize() -> void:
 	_delete()
 	_mesh()
 	_extrude()
+	_inset()
+	_bevel()
 	print("mesh data: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -145,3 +147,98 @@ func _extrude() -> void:
 	b.verts[0] = Vector3(9, 9, 9)
 	b.delete_verts({1: true})
 	ok(a.vert_count() == 8 and a.verts[0] == Vector3(-1, -1, -1) and a.edge_count() == 12, "copy() shares nothing")
+
+
+func _closed(m: MeshData, label: String) -> void:
+	ok(m.vert_count() - m.edge_count() + m.face_count() == 2,
+			"%s is a closed shell (%d v, %d e, %d f)" % [label, m.vert_count(), m.edge_count(), m.face_count()])
+	var efm := m.edge_face_map()
+	var open := 0
+	for e in efm:
+		if efm[e].size() != 2:
+			open += 1
+	ok(open == 0, "%s: every edge has two faces (%d do not)" % [label, open])
+
+
+func _inset() -> void:
+	var m := MeshData.make_cube()
+	var job := m.inset_begin({1: true})
+	m.job_set(job, 0.25)
+	ok(m.vert_count() == 12 and m.face_count() == 10, "cube top inset: 12 v, 10 f (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "inset cube")
+	var flat := true
+	var inner := true
+	for i in job.moving:
+		flat = flat and is_equal_approx(m.verts[i].y, 1.0)
+		inner = inner and is_equal_approx(absf(m.verts[i].x), 0.75) and is_equal_approx(absf(m.verts[i].z), 0.75)
+	ok(flat, "the ring lies flat in the top")
+	ok(inner, "a quarter in from every edge")
+	_outward_all(m, Vector3.ZERO, "inset cube")
+	m.job_set(job, 0.25, 0.5)
+	var raised := true
+	for i in job.moving:
+		raised = raised and is_equal_approx(m.verts[i].y, 1.5)
+	ok(raised, "DEPTH lifts the inner face along its normal")
+	# Two neighbouring faces inset as one region: one ring, not two.
+	m = MeshData.make_cube()
+	job = m.inset_begin({1: true, 4: true})
+	m.job_set(job, 0.25)
+	ok(m.face_count() == 6 + 6, "two faces inset as a region add six ring faces (%d)" % m.face_count())
+	_closed(m, "region inset")
+
+
+func _bevel() -> void:
+	# One edge of a cube: the edge becomes a strip, its two ends split.
+	var m := MeshData.make_cube()
+	var e := m.edge_index(4, 5)   # the top's -z edge
+	var job := m.bevel_begin({e: true})
+	m.job_set(job, 0.25)
+	ok(m.vert_count() == 10 and m.face_count() == 7, "one cube edge bevelled: 10 v, 7 f (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "bevelled edge")
+	_outward_all(m, Vector3.ZERO, "bevelled edge")
+	var on_top := 0
+	var on_side := 0
+	for i in job.moving:
+		var v: Vector3 = m.verts[i]
+		if is_equal_approx(v.y, 1.0) and is_equal_approx(v.z, -0.75):
+			on_top += 1
+		if is_equal_approx(v.z, -1.0) and is_equal_approx(v.y, 0.75):
+			on_side += 1
+	ok(on_top == 2 and on_side == 2, "the new edges sit 0.25 in on the top and down the side (%d, %d)" % [on_top, on_side])
+	# Every edge: corners become triangles.
+	m = MeshData.make_cube()
+	var all := {}
+	for i in m.edge_count():
+		all[i] = true
+	job = m.bevel_begin(all)
+	m.job_set(job, 0.2)
+	ok(m.vert_count() == 24 and m.face_count() == 26,
+			"every cube edge bevelled: 24 v, 26 f (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "bevelled cube")
+	_outward_all(m, Vector3.ZERO, "bevelled cube")
+	var tris := 0
+	for f in m.faces:
+		if f.size() == 3:
+			tris += 1
+	ok(tris == 8, "with a triangle at each corner (%d)" % tris)
+	# The ring of four edges round the top.
+	m = MeshData.make_cube()
+	var ring := {}
+	for pair in [[4, 5], [5, 6], [6, 7], [7, 4]]:
+		ring[m.edge_index(pair[0], pair[1])] = true
+	job = m.bevel_begin(ring)
+	m.job_set(job, 0.25)
+	ok(m.face_count() == 6 + 4 and m.vert_count() == 12,
+			"the top ring bevelled: 12 v, 10 f, a strip all round (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "bevelled ring")
+	# The amount stops before the new edges cross.
+	m = MeshData.make_cube()
+	job = m.bevel_begin({m.edge_index(4, 5): true})
+	m.job_set(job, 50.0)
+	var inside := true
+	for v in m.verts:
+		inside = inside and absf(v.x) <= 1.0001 and absf(v.y) <= 1.0001 and absf(v.z) <= 1.0001
+	ok(inside, "a huge amount is clamped inside the cube")
+	# A plane's border edge has one face: nothing to bevel.
+	m = MeshData.make_plane()
+	ok(m.bevel_begin({0: true}).is_empty(), "a border edge is not bevelled")

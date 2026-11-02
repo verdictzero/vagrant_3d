@@ -92,10 +92,10 @@ func view_name() -> String:
 	return ""
 
 
-## Snap to a named view, orthographic. The same view again flips to its
-## opposite, the way a second tap on the gizmo does in Blender.
-func set_view(view: String) -> void:
-	if view_name() == view:
+## Snap to a named view, orthographic. With `flip`, the same view again
+## flips to its opposite, the way a second tap on the gizmo does in Blender.
+func set_view(view: String, flip := true) -> void:
+	if flip and view_name() == view:
 		view = OPPOSITE[view]
 	var v: Array = VIEWS[view]
 	yaw = v[0]

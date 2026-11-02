@@ -82,6 +82,36 @@ func _initialize() -> void:
 	ed._refresh_lists()
 	await _frames(6)
 	_shot("front_add")
+	ed.close_popover()
+	# Bevel every edge of the cube, then inset its top and sink it.
+	ed.orbit.set_ortho(false)
+	ed.orbit.yaw = -0.6
+	ed.orbit.pitch = -0.5
+	ed.orbit.apply()
+	ed.select_object(cube)
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.EDGE)
+	var all := {}
+	for i in cube.data.edge_count():
+		all[i] = true
+	ed.select_edges(all)
+	ed.tool_start("BEVEL")
+	ed.tool_set(0, 0.2)
+	await _frames(6)
+	_shot("bevel")
+	ed.tool_apply()
+	ed.set_elem(ed.Elem.FACE)
+	var top := -1
+	for f in cube.data.face_count():
+		if cube.data.face_normal(f).y > 0.99:
+			top = f
+	ed.select_faces({top: true})
+	ed.tool_start("INSET")
+	ed.tool_set(0, 0.3)
+	ed.tool_set(1, -0.4)
+	ed._refresh_props()
+	await _frames(6)
+	_shot("inset")
 	quit(0)
 
 

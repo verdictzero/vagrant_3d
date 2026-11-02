@@ -1,7 +1,8 @@
 # The editor
 
 Objects and groups in a hierarchy, four primitives, OBJECT and EDIT mode
-with VERT / EDGE / FACE, SELECT and MOVE, snapping, matcaps. Android first,
+with VERT / EDGE / FACE, move, rotate, scale, extrude, inset and bevel,
+undo and redo, snapping, matcaps. Android first,
 S Pen aware, laid out for a tablet or a foldable. The UI speaks the house
 style: `DOC_ui_style.md` is the why, `DOC_ui_design_tokens.md` the numbers.
 This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
@@ -31,8 +32,8 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 ## The screen
 
 Blender's shape. The header across the top: OBJECT / EDIT, VERT / EDGE /
-FACE, ADD (a menu of the primitives and GROUP), and at the right end SNAP
-and SHADING, which open popovers under it. The tool column down the left,
+FACE, ADD (a menu of the primitives and GROUP), and at the right end UNDO
+and REDO, then SNAP and SHADING, which open popovers under it. The tool column down the left,
 icons only, changing with the mode. The hierarchy over the properties down
 the right, each half the height. The view is what is left, with the axes
 ball in its top-right corner and ORTHO under it.
@@ -75,8 +76,11 @@ When the rows outgrow the panel, a drag up or down them scrolls, as does
 the bar at the right edge or a wheel.
 
 The properties panel under it shows the active object: its name and type,
-location, rotation, and mesh counts or child count. Read-only for now; it
-will grow into Blender's properties editor.
+location, rotation and scale, and mesh counts or child count. Location,
+rotation and scale are fields, the way Blender's are: drag one sideways to
+change it, a hundredth of a unit, half a degree or half a percent per
+pixel. Each drag is one undo step. The rest will grow into Blender's
+properties editor.
 
 **Groups** are objects with no mesh. ADD > GROUP with objects selected wraps
 them: the group sits at their centre and they become its children. With
@@ -100,28 +104,47 @@ While a move is held to a target, a square mark sits on it in the view.
 ## Tools and the tool window
 
 The tool column on the left is SELECT, MOVE, then the tools the mode has,
-then DELETE. In OBJECT mode: ROTATE. In EDIT mode: ROTATE, EXTRUDE,
-EXTRUDE NORMALS, BEVEL and INSET. A tool that cannot run on what is
-selected is dimmed. Select something, tap a tool: it runs at once at zero
+then DELETE. In OBJECT mode: ROTATE, SCALE. In EDIT mode: ROTATE, SCALE,
+EXTRUDE, EXTRUDE NORMALS, INSET and BEVEL. A tool that cannot run on what
+is selected is dimmed. Select something, tap a tool: it runs at once at zero
 and the **tool window** comes up in the bottom-left of the view: the tool's
 name, one row per property with a slider to pull and the value as a number,
 then APPLY and CANCEL. Every tool uses the same window; it only differs in
 which rows it shows. A drag in the view while a tool is the pointer drives
-it too, and starts it again if none is running. With snapping on, lengths go in STEP increments and
-angles in 5 degree steps. Anything that moves on, such as another
+it too, and starts it again if none is running. With snapping on, moves and extrudes go in STEP
+increments, inset and bevel in fifths of a STEP, angles in 5 degree steps
+and scale in tenths. Anything that moves on, such as another
 selection, a mode change or another tool, applies the live one first.
 
 | Tool | Rows | Does |
 |---|---|---|
 | TRANSLATE | X Y Z | Moves the selection by a world offset. **A MOVE drag is this tool**: the window comes up with the live offset and stays for fine adjustment |
 | ROTATE | X Y Z, degrees | Turns the selection about its centre. A drag in the view turns about the world axis the camera looks down most |
+| SCALE | X Y Z, factors | Scales the selection about its centre. A drag in the view scales evenly, by how far the pointer is from the centre against where it started |
 | EXTRUDE | AMOUNT | Faces: the region rises along its normal, its rim grows walls, the old faces go. Edges: each grows a quad. Vertices: each grows a wire edge |
 | EXTRUDE NORMALS | AMOUNT | The same, but every vertex moves along its own normal |
-| BEVEL, INSET | | Listed, not built yet |
+| INSET | THICKNESS, DEPTH | Faces, as one region: a ring of faces grows inward round it, THICKNESS wide square to each edge; DEPTH lifts or sinks the inner region |
+| BEVEL | AMOUNT | Edges with a face on each side, one segment: each becomes a strip, its new edges AMOUNT from the old one in each face; a corner where three bevelled edges meet becomes a triangle. The amount stops before new edges would cross |
 
 `scripts/SCRIPT_tool_window.gd` is the window; the jobs are in
 `scripts/SCRIPT_editor.gd` under "tools", and the extrude operations are
 `MeshData.extrude_begin` / `extrude_set` in `scripts/SCRIPT_mesh_data.gd`.
+
+## Undo
+
+Every change is a step: adding, grouping, parenting, deleting, a tool
+applied, a property dragged. UNDO and REDO are in the header; a
+**two-finger tap** in the view is undo and a **three-finger tap** is redo;
+Ctrl+Z and Ctrl+Shift+Z work on a keyboard. With a tool live, undo cancels
+it. Undo puts the selection and mode back as they were going into the step,
+so undoing an extrude leaves you in EDIT with the face you had picked. The
+history keeps 64 steps. Changing mode, selection or view is not a step.
+
+## Keys
+
+For a keyboard on the tablet or at a desk, Blender's: Tab, 1 2 3, G R S,
+E, I, Ctrl+B, X or Delete, Shift+A, Enter, Escape, Ctrl+Z, Ctrl+Shift+Z,
+numpad 1 3 7 (with Ctrl for the opposite) and numpad 5.
 
 ## Shading
 

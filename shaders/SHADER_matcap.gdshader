@@ -9,7 +9,8 @@ uniform float tint : hint_range(0.0, 2.0) = 1.0;
 varying vec3 v_normal;
 
 void vertex() {
-	v_normal = normalize((MODELVIEW_MATRIX * vec4(NORMAL, 0.0)).xyz);
+	// The normal matrix, not the model-view: a scaled object keeps its shading.
+	v_normal = normalize(MODELVIEW_NORMAL_MATRIX * NORMAL);
 }
 
 void fragment() {
