@@ -1,8 +1,9 @@
 # The editor
 
 Objects and groups in a hierarchy, four primitives, OBJECT and EDIT mode
-with VERT / EDGE / FACE, move, rotate, scale, extrude, inset and bevel,
-undo and redo, snapping, matcaps. Android first,
+with VERT / EDGE / FACE, move, rotate, scale, extrude, inset, bevel, loop
+cut and duplicate, transform gizmos, undo and redo, saving and OBJ export,
+snapping, matcaps. Android first,
 S Pen aware, laid out for a tablet or a foldable. The UI speaks the house
 style: `DOC_ui_style.md` is the why, `DOC_ui_design_tokens.md` the numbers.
 This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
@@ -20,6 +21,8 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 | `scripts/SCRIPT_icons.gd` | Blender's icon vocabulary redrawn as mono line glyphs |
 | `scripts/SCRIPT_matcaps.gd`, `scripts/SCRIPT_matcap_grid.gd` | The sixteen matcaps and the gallery |
 | `shaders/SHADER_matcap.gdshader` | The matcap shader |
+| `scripts/SCRIPT_transform_gizmo.gd` | The move, rotate and scale gizmos: geometry, picking, drawing |
+| `scripts/SCRIPT_scene_file.gd` | Scenes as JSON in user://scenes/, and OBJ export |
 | `scripts/SCRIPT_tool_window.gd` | The tool window: a slider and a number per property, APPLY, CANCEL |
 | `scripts/SCRIPT_viewport_overlay.gd` | Wires, selection, hover, the box, the snap mark, group axes, the status line |
 | `scripts/SCRIPT_chamfer_panel.gd` | The cut-corner frame |
@@ -31,9 +34,10 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 
 ## The screen
 
-Blender's shape. The header across the top: OBJECT / EDIT, VERT / EDGE /
-FACE, ADD (a menu of the primitives and GROUP), and at the right end UNDO
-and REDO, then SNAP and SHADING, which open popovers under it. The tool column down the left,
+Blender's shape. The header across the top: FILE, OBJECT / EDIT, VERT /
+EDGE / FACE, SELECT (all, none, invert), ADD (the primitives and GROUP), and
+at the right end UNDO and REDO, then SNAP and SHADING. FILE, SELECT, ADD,
+SNAP and SHADING open popovers under it. The tool column down the left,
 icons only, changing with the mode. The hierarchy over the properties down
 the right, each half the height. The view is what is left, with the axes
 ball in its top-right corner and ORTHO under it.
@@ -104,9 +108,9 @@ While a move is held to a target, a square mark sits on it in the view.
 ## Tools and the tool window
 
 The tool column on the left is SELECT, MOVE, then the tools the mode has,
-then DELETE. In OBJECT mode: ROTATE, SCALE. In EDIT mode: ROTATE, SCALE,
-EXTRUDE, EXTRUDE NORMALS, INSET and BEVEL. A tool that cannot run on what
-is selected is dimmed. Select something, tap a tool: it runs at once at zero
+then DUPLICATE and DELETE. In OBJECT mode: ROTATE, SCALE. In EDIT mode:
+ROTATE, SCALE, EXTRUDE, EXTRUDE NORMALS, INSET, BEVEL and LOOP CUT. A tool
+that cannot run on what is selected is dimmed. Select something, tap a tool: it runs at once at zero
 and the **tool window** comes up in the bottom-left of the view: the tool's
 name, one row per property with a slider to pull and the value as a number,
 then APPLY and CANCEL. Every tool uses the same window; it only differs in
@@ -124,11 +128,37 @@ selection, a mode change or another tool, applies the live one first.
 | EXTRUDE | AMOUNT | Faces: the region rises along its normal, its rim grows walls, the old faces go. Edges: each grows a quad. Vertices: each grows a wire edge |
 | EXTRUDE NORMALS | AMOUNT | The same, but every vertex moves along its own normal |
 | INSET | THICKNESS, DEPTH | Faces, as one region: a ring of faces grows inward round it, THICKNESS wide square to each edge; DEPTH lifts or sinks the inner region |
+| LOOP CUT | FACTOR | From a selected edge, one cut across the ring of quads it starts, until the ring closes or meets a non-quad or the border. FACTOR slides the cut from one side to the other |
 | BEVEL | AMOUNT | Edges with a face on each side, one segment: each becomes a strip, its new edges AMOUNT from the old one in each face; a corner where three bevelled edges meet becomes a triangle. The amount stops before new edges would cross |
 
 `scripts/SCRIPT_tool_window.gd` is the window; the jobs are in
 `scripts/SCRIPT_editor.gd` under "tools", and the extrude operations are
 `MeshData.extrude_begin` / `extrude_set` in `scripts/SCRIPT_mesh_data.gd`.
+
+DUPLICATE copies the selection in place (objects with their children, or
+in EDIT the selected faces, edges and vertices) and leaves MOVE as the
+pointer, so the next drag moves the copy.
+
+## Gizmos
+
+While MOVE is the pointer, arrows sit at the selection's centre; while
+ROTATE or SCALE is the tool, rings or square-ended handles do. They keep one
+size on screen at any zoom, and are told apart by their letters. Drag an
+arrow to move along its world axis (snapped to the grid with snapping on),
+a ring to turn about its axis, a handle to scale along it; the centre
+square moves freely, or under SCALE scales evenly. A press on a handle wins
+over picking. The drag runs the matching tool, so its numbers are in the
+tool window and it stays live: drag X, then Y, and both are one move.
+
+## Files
+
+FILE has NEW, SAVE, SAVE AS NEW, the saved scenes to OPEN, and EXPORT OBJ.
+Scenes save to the app's own storage, named SCENE 001 and on; the status
+line leads with the name, and a star while there are unsaved changes. NEW
+and OPEN are undo steps, so the scene before is an undo away. EXPORT OBJ
+writes every mesh in world space to Documents/Vagrant3D/ (desktop Blender
+reads it), or to the app's storage where Documents cannot be written; the
+flash line says which.
 
 ## Undo
 
@@ -143,8 +173,9 @@ history keeps 64 steps. Changing mode, selection or view is not a step.
 ## Keys
 
 For a keyboard on the tablet or at a desk, Blender's: Tab, 1 2 3, G R S,
-E, I, Ctrl+B, X or Delete, Shift+A, Enter, Escape, Ctrl+Z, Ctrl+Shift+Z,
-numpad 1 3 7 (with Ctrl for the opposite) and numpad 5.
+E, I, Ctrl+B, Ctrl+R, Shift+D, X or Delete, A, Alt+A, Ctrl+I, Shift+A,
+Enter, Escape, Ctrl+Z, Ctrl+Shift+Z, Ctrl+S (Shift for a new file), Ctrl+N,
+Ctrl+O, numpad 1 3 7 (with Ctrl for the opposite) and numpad 5.
 
 ## Shading
 

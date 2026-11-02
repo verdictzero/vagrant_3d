@@ -112,6 +112,27 @@ func _initialize() -> void:
 	ed._refresh_props()
 	await _frames(6)
 	_shot("inset")
+	ed.tool_apply()
+	ed.set_mode(ed.Mode.OBJECT)
+	ed.select_object(cube)
+	ed._on_toolbar_tapped("MOVE")
+	await _frames(6)
+	_shot("gizmo_move")
+	ed._on_toolbar_tapped("ROTATE")
+	ed.tool_set(1, 20.0)
+	await _frames(6)
+	_shot("gizmo_rotate")
+	ed.tool_cancel()
+	ed.pointer = ed.Pointer.SELECT
+	for n in SceneFile.list():
+		SceneFile.delete(n)
+	ed.file_save(false)
+	ed.file_save(true)
+	ed.open_popover("FILE")
+	await _frames(6)
+	_shot("file")
+	for n in SceneFile.list():
+		SceneFile.delete(n)
 	quit(0)
 
 

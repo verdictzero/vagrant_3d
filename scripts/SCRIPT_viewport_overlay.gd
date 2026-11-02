@@ -33,6 +33,7 @@ func _draw() -> void:
 		_draw_object_mode(cam)
 	else:
 		_draw_edit_mode(cam)
+	editor.gizmo_draw(self)
 	if editor.box_active:
 		var r: Rect2 = editor.box_rect()
 		draw_rect(r, T.SEL_BG, true)
@@ -50,6 +51,22 @@ func _draw() -> void:
 		draw_line(p + Vector2(0, -10), p + Vector2(0, -3), T.COL_NAME, 1.0)
 		draw_line(p + Vector2(0, 3), p + Vector2(0, 10), T.COL_NAME, 1.0)
 	_draw_status()
+	_draw_flash()
+
+
+## A message over the top of the view that fades out over its last second.
+func _draw_flash() -> void:
+	var left: int = editor.flash_until - Time.get_ticks_msec()
+	if left <= 0 or editor.flash_text == "":
+		return
+	var view: Rect2 = editor.view_rect
+	var f: Font = Fonts.ui()
+	var a := clampf(float(left) / 1000.0, 0.0, 1.0)
+	var col := Color(T.COL_BRIGHT, a)
+	var w := f.get_string_size(editor.flash_text, HORIZONTAL_ALIGNMENT_LEFT, -1, T.FS_ROW).x
+	var at := Vector2(view.get_center().x - w * 0.5, view.position.y + 34.0)
+	draw_string_outline(f, at, editor.flash_text, HORIZONTAL_ALIGNMENT_LEFT, -1, T.FS_ROW, 4, Color(0, 0, 0, a))
+	draw_string(f, at, editor.flash_text, HORIZONTAL_ALIGNMENT_LEFT, -1, T.FS_ROW, col)
 
 
 ## Groups have no mesh: they show as plain axes at their origin, lit when

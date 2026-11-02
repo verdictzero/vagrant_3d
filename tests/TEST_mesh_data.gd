@@ -22,6 +22,9 @@ func _initialize() -> void:
 	_extrude()
 	_inset()
 	_bevel()
+	_loopcut()
+	_duplicate()
+	_dict()
 	print("mesh data: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -242,3 +245,76 @@ func _bevel() -> void:
 	# A plane's border edge has one face: nothing to bevel.
 	m = MeshData.make_plane()
 	ok(m.bevel_begin({0: true}).is_empty(), "a border edge is not bevelled")
+
+
+func _loopcut() -> void:
+	# A side edge of the cube: the ring runs round the four sides.
+	var m := MeshData.make_cube()
+	var job := m.loopcut_begin(m.edge_index(0, 4))
+	ok(job.moving.size() == 4, "a cut round the cube's sides makes four verts (%d)" % job.moving.size())
+	m.job_set(job, 0.0)
+	_closed(m, "loop cut cube")
+	ok(m.face_count() == 10, "the four sides split into eight (%d faces)" % m.face_count())
+	var level := true
+	for i in job.moving:
+		level = level and is_zero_approx(m.verts[i].y)
+	ok(level, "at FACTOR 0 the cut is round the middle")
+	m.job_set(job, 0.5)
+	var ys := {}
+	for i in job.moving:
+		ys[snappedf(m.verts[i].y, 0.001)] = true
+	ok(ys.size() == 1 and absf(ys.keys()[0]) > 0.4, "FACTOR slides every cut vertex the same way (%s)" % str(ys.keys()))
+	_outward_all(m, Vector3.ZERO, "loop cut cube")
+	# A strip of two quads, cut from a long border edge: it crosses one quad.
+	var g := MeshData.new()
+	for p in [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(2, 0, 0), Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(2, 0, 1)]:
+		g.add_vert(p)
+	g.add_face(PackedInt32Array([0, 3, 4, 1]))
+	g.add_face(PackedInt32Array([1, 4, 5, 2]))
+	job = g.loopcut_begin(g.edge_index(0, 1))
+	ok(job.moving.size() == 2 and g.face_count() == 3, "across one quad of a strip: 2 verts, 3 faces (%d, %d)" % [job.moving.size(), g.face_count()])
+	# Cut from the strip's end edge: across both quads, an open ring.
+	g = MeshData.new()
+	for p in [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(2, 0, 0), Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(2, 0, 1)]:
+		g.add_vert(p)
+	g.add_face(PackedInt32Array([0, 3, 4, 1]))
+	g.add_face(PackedInt32Array([1, 4, 5, 2]))
+	job = g.loopcut_begin(g.edge_index(0, 3))
+	ok(job.moving.size() == 3 and g.face_count() == 4, "across both quads of a strip: 3 verts, 4 faces (%d, %d)" % [job.moving.size(), g.face_count()])
+	# A triangle stops the ring and gains the vertex.
+	m = MeshData.new()
+	for p in [Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1), Vector3(0.5, 0, 2)]:
+		m.add_vert(p)
+	m.add_face(PackedInt32Array([0, 3, 2, 1]))
+	m.add_face(PackedInt32Array([3, 4, 2]))
+	job = m.loopcut_begin(m.edge_index(0, 1))
+	var sizes := []
+	for f in m.faces:
+		sizes.append(f.size())
+	sizes.sort()
+	ok(sizes == [4, 4, 4], "a quad then a triangle: the quad splits, the triangle becomes a quad (%s)" % str(sizes))
+
+
+func _duplicate() -> void:
+	var m := MeshData.make_cube()
+	var top := {4: true, 5: true, 6: true, 7: true}
+	var made := m.duplicate_selection(top)
+	ok(made.size() == 4 and m.vert_count() == 12, "duplicating the top's verts adds four (%d)" % m.vert_count())
+	ok(m.face_count() == 7, "and a copy of the top face (%d faces)" % m.face_count())
+	var copy_face := m.faces[6]
+	var all_new := true
+	for i in copy_face:
+		all_new = all_new and made.has(i)
+	ok(all_new, "built from the copies")
+	m = MeshData.make_cube()
+	made = m.duplicate_selection({4: true, 5: true})
+	ok(made.size() == 2 and m.face_count() == 6 and m.edge_count() == 13, "two verts: their edge, as a wire (%d e)" % m.edge_count())
+
+
+func _dict() -> void:
+	var m := MeshData.make_cube()
+	m.duplicate_selection({4: true, 5: true})
+	var back := MeshData.from_dict(JSON.parse_string(JSON.stringify(m.to_dict())))
+	ok(back.vert_count() == m.vert_count() and back.edge_count() == m.edge_count() and back.face_count() == m.face_count(),
+			"a mesh survives JSON, wire edge and all (%d v %d e %d f)" % [back.vert_count(), back.edge_count(), back.face_count()])
+	ok(back.verts[3].is_equal_approx(m.verts[3]) and back.faces[2] == m.faces[2], "positions and faces the same")

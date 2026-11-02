@@ -57,6 +57,10 @@ func _initialize() -> void:
 	await _new_tools()
 	await _history()
 	await _scrub_and_keys()
+	await _gizmos()
+	await _loopcut_and_duplicate()
+	await _select_menu()
+	await _files()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -653,7 +657,7 @@ func _view() -> void:
 	ed.orbit.yaw = -0.6
 	ed.orbit.pitch = -0.5
 	ed.orbit.set_ortho(false)
-	ok(ed.status_words().begins_with("USER PERSP"), "a free view reads USER PERSP (%s)" % ed.status_words())
+	ok(ed.status_words().contains("    USER PERSP"), "a free view reads USER PERSP (%s)" % ed.status_words())
 	var p := _row_center(ed.proj_list, 0)
 	_pen_tap(p)
 	await _settle()
@@ -668,7 +672,7 @@ func _view() -> void:
 	await _settle()
 	ok(ed.orbit.view_name() == "FRONT", "a tap on Z looks from the front (%s)" % ed.orbit.view_name())
 	ok(ed.orbit.ortho and ed.orbit.auto_ortho, "and goes orthographic by itself")
-	ok(ed.status_words().begins_with("FRONT ORTHO"), "the status says FRONT ORTHO")
+	ok(ed.status_words().contains("    FRONT ORTHO"), "the status says FRONT ORTHO")
 	z = ed.gizmo.global_position + ed.gizmo.end_point(Vector3.BACK)[0]
 	_pen_tap(z)
 	await _settle()
@@ -1008,3 +1012,219 @@ func _scrub_and_keys() -> void:
 	_key(KEY_ESCAPE)
 	ok(not ed.popover.visible, "Escape closes it")
 	_frame(Vector3.ZERO)
+
+
+func _gizmos() -> void:
+	ed.close_popover()
+	ed.set_mode(ed.Mode.OBJECT)
+	ed.snap_on = true
+	ed.snap_targets.INCREMENT = true
+	ed.snap_absolute = true
+	var c := _fresh_cube(Vector3(0, 0, 30))
+	c.rotation = Vector3.ZERO
+	c.scale = Vector3.ONE
+	await _settle()
+	ed.pointer = ed.Pointer.SELECT
+	ok(ed.gizmo_kind() == "", "no gizmo while SELECT is the pointer")
+	ed._on_toolbar_tapped("MOVE")
+	ed._gizmo_sync()
+	ok(ed.gizmo_kind() == "MOVE" and ed.xgizmo.visible(), "MOVE shows the arrows")
+	ok(ed.xgizmo.pivot.is_equal_approx(c.global_position), "at the object's origin")
+	# Drag the X arrow: the cube moves along X only, onto the grid.
+	var sh: Array = ed.xgizmo.shaft(0)
+	var tip: Vector2 = sh[1]
+	var along: Vector2 = (tip - ed.xgizmo.centre()).normalized()
+	ok(ed.gizmo_pick(tip, ed.PEN_RADIUS) == "X", "the X arrow's tip picks X")
+	_pen_drag(tip, tip + along * 70.0 + Vector2(0, 25))
+	await _settle()
+	var p: Vector3 = c.global_position
+	ok(p.x > 0.4 and is_zero_approx(p.y) and is_equal_approx(p.z, 30.0), "the X arrow moves along X only (%s)" % p)
+	ok(is_zero_approx(fmod(p.x, 0.25)), "and lands on the grid (%.3f)" % p.x)
+	ok(ed.tool_kind() == "TRANSLATE" and ed.tool_window.visible, "with the TRANSLATE numbers up")
+	# Again on Y continues the same move.
+	sh = ed.xgizmo.shaft(1)
+	tip = sh[1]
+	along = (tip - ed.xgizmo.centre()).normalized()
+	_pen_drag(tip, tip + along * 50.0)
+	await _settle()
+	p = c.global_position
+	ok(p.y > 0.2 and p.x > 0.4, "the Y arrow next moves up, keeping the X move (%s)" % p)
+	ed.tool_apply()
+	ok(ed.history_label() == "TRANSLATE", "one undo step for the move")
+	# The rotate rings.
+	c.global_position = Vector3(0, 0, 30)
+	ed._on_toolbar_tapped("ROTATE")
+	ed.tool_cancel()
+	await _settle()
+	ed._gizmo_sync()
+	ok(ed.gizmo_kind() == "ROTATE", "ROTATE as the tool shows the rings")
+	var ring: PackedVector2Array = ed.xgizmo.ring(1)
+	var on_ring: Vector2 = ring[0]
+	ok(ed.gizmo_pick(on_ring, ed.PEN_RADIUS) == "Y" or ed.gizmo_pick(ring[12], ed.PEN_RADIUS) == "Y",
+			"a point on the Y ring picks Y")
+	var cen: Vector2 = ed.xgizmo.centre()
+	var start: Vector2 = ring[12] if ed.gizmo_pick(ring[12], ed.PEN_RADIUS) == "Y" else ring[0]
+	var r := start - cen
+	var end := cen + r.rotated(-0.6)
+	_pen(start, true)
+	_pen_move(start, cen + r.rotated(-0.3), true)
+	_pen_move(cen + r.rotated(-0.3), end, true)
+	_pen(end, false)
+	await _settle()
+	var vals: Array = ed.tool_values()
+	ok(ed.tool_kind() == "ROTATE" and absf(vals[1]) >= 5.0 and is_zero_approx(vals[0]) and is_zero_approx(vals[2]),
+			"dragging round the Y ring turns about Y only (%s)" % str(vals))
+	ok(is_zero_approx(fmod(absf(vals[1]), 5.0)), "in 5 degree steps")
+	ed.tool_cancel()
+	# The scale handles.
+	ed._on_toolbar_tapped("SCALE")
+	ed.tool_cancel()
+	ed._gizmo_sync()
+	sh = ed.xgizmo.shaft(2)
+	if sh.is_empty():
+		sh = ed.xgizmo.shaft(0)
+	tip = sh[1]
+	var which: String = ed.gizmo_pick(tip, ed.PEN_RADIUS)
+	along = (tip - ed.xgizmo.centre()).normalized()
+	_pen_drag(tip, tip + along * 60.0)
+	await _settle()
+	var sc: Vector3 = c.scale
+	var ai := "XYZ".find(which)
+	ok(ai >= 0 and sc[ai] > 1.2 and is_equal_approx(sc[(ai + 1) % 3], 1.0), "a scale handle stretches its own axis only (%s on %s)" % [sc, which])
+	ed.tool_cancel()
+	# The centre handle scales evenly.
+	cen = ed.xgizmo.centre()
+	ok(ed.gizmo_pick(cen, ed.PEN_RADIUS) == "C", "the centre is its own handle")
+	ed.pointer = ed.Pointer.SELECT
+	ok(ed.gizmo_kind() == "", "and SELECT hides it again")
+
+
+func _loopcut_and_duplicate() -> void:
+	var c := _fresh_cube(Vector3(0, 0, -30))
+	await _settle()
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.EDGE)
+	ed.select_edges({c.data.edge_index(0, 4): true})
+	ok(ed.toolbar.index_of("LOOP CUT") >= 0 and not ed.toolbar.items[ed.toolbar.index_of("LOOP CUT")].disabled,
+			"LOOP CUT is on the column, live with an edge selected")
+	var p := _row_center(ed.toolbar, ed.toolbar.index_of("LOOP CUT"))
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.tool_kind() == "LOOP CUT" and c.data.face_count() == 10, "a tap cuts round the sides (%d faces)" % c.data.face_count())
+	ok(ed.sel_edges.size() == 4, "the new loop is selected (%d edges)" % ed.sel_edges.size())
+	ed.tool_set(0, 0.47)
+	ok(is_equal_approx(ed.tool_value(), 0.5), "FACTOR snaps in tenths (%.2f)" % ed.tool_value())
+	ed.tool_apply()
+	ok(ed.history_label() == "LOOP CUT", "applied as a step")
+	# Duplicate in EDIT: the selected loop's edges, copied in place.
+	var v0: int = c.data.vert_count()
+	var e0: int = c.data.edge_count()
+	ed._on_toolbar_tapped("DUPLICATE")
+	ok(c.data.vert_count() == v0 + 4 and c.data.edge_count() == e0 + 4, "DUPLICATE in EDIT copies the loop (%d v, %d e)" % [c.data.vert_count(), c.data.edge_count()])
+	ok(ed.pointer == ed.Pointer.MOVE and ed.history_label() == "DUPLICATE", "and leaves MOVE as the pointer, as a step")
+	var moved_new := true
+	for i in ed.sel_verts:
+		moved_new = moved_new and i >= v0
+	ok(moved_new, "the copies are the selection")
+	ed.undo()
+	# Undo rebuilds the scene: nodes held from before are gone, so look again.
+	ok(not is_instance_valid(c) or c.is_queued_for_deletion(), "undo rebuilds the scene's nodes")
+	c = ed.active_object
+	ok(c.data.vert_count() == v0, "and takes the copies away")
+	# Duplicate objects: a parent with a child, copied together.
+	ed.set_mode(ed.Mode.OBJECT)
+	var kid: Node3D = ed.add_primitive("SPHERE")
+	kid.global_position = c.global_position + Vector3(3, 0, 0)
+	ed.reparent_object(kid, c)
+	var n0: int = ed.objects().size()
+	ed.select_object(c)
+	ed.duplicate_selected()
+	ok(ed.objects().size() == n0 + 2, "duplicating a parent copies its child too (%d)" % ed.objects().size())
+	var copy: Node3D = ed.active_object
+	ok(copy != c and copy.get_parent() == c.get_parent() and copy.global_transform.is_equal_approx(c.global_transform),
+			"the copy sits beside it, in the same place")
+	ok(copy.child_objects().size() == 1 and copy.child_objects()[0].global_position.is_equal_approx(kid.global_position),
+			"with its child where the child was")
+	ok(copy.name.begins_with("Cube ") and copy.name != c.name, "under a name of its own (%s)" % copy.name)
+	ok(copy.data != c.data, "and a mesh of its own")
+
+
+func _select_menu() -> void:
+	ed.set_mode(ed.Mode.OBJECT)
+	var p := _row_center(ed.select_bar, 0)
+	_pen_tap(p)
+	await _settle()
+	ok(ed.popover.visible and ed.popover_kind == "SELECT", "SELECT opens its menu")
+	var all_row: Vector2 = ed.select_menu.global_position + ed.select_menu.row_rect(0).get_center()
+	_pen_tap(all_row)
+	ok(ed.sel_objects.size() == ed.objects().size() and not ed.popover.visible, "ALL selects every object")
+	ed.select_all("NONE")
+	ok(ed.sel_objects.is_empty() and ed.active_object == null, "NONE clears")
+	var a: Node3D = ed.objects()[0]
+	ed.select_object(a)
+	ed.select_all("INVERT")
+	ok(not ed.sel_objects.has(a) and ed.sel_objects.size() == ed.objects().size() - 1, "INVERT flips it")
+	ed.select_object(a)
+	if a.has_mesh():
+		ed.set_mode(ed.Mode.EDIT)
+		ed.set_elem(ed.Elem.FACE)
+		ed.select_faces({0: true})
+		ed.select_all("INVERT")
+		ok(ed.sel_faces.size() == a.data.face_count() - 1 and not ed.sel_faces.has(0), "INVERT in face mode flips the faces")
+		_key(KEY_A)
+		ok(ed.sel_faces.size() == a.data.face_count(), "A selects every face")
+		_key(KEY_A, false, false)
+		var e := InputEventKey.new()
+		e.keycode = KEY_A
+		e.pressed = true
+		e.alt_pressed = true
+		root.push_input(e, true)
+		ok(ed.sel_verts.is_empty(), "Alt+A selects none")
+		ed.set_mode(ed.Mode.OBJECT)
+
+
+func _files() -> void:
+	# Start clean: no saved scenes from an earlier run.
+	for n in SceneFile.list():
+		SceneFile.delete(n)
+	ed.file_new()
+	ok(ed.objects().is_empty() and ed.scene_name == "" and not ed.is_dirty(), "NEW is an empty, untitled, unchanged scene")
+	ok(ed.history_label() == "NEW", "and an undo step")
+	var c: Node3D = ed.add_primitive("CUBE")
+	c.position = Vector3(1, 2, 3)
+	var s: Node3D = ed.add_primitive("SPHERE")
+	ed.reparent_object(s, c)
+	ok(ed.is_dirty() and ed.status_words().begins_with("UNTITLED*"), "changes mark it (%s)" % ed.status_words())
+	ok(ed.file_save(false) and ed.scene_name == "SCENE 001", "SAVE names the first scene SCENE 001")
+	ok(not ed.is_dirty() and ed.status_words().begins_with("SCENE 001    "), "and it is clean")
+	ok(ed.flash_text == "SAVED SCENE 001", "the flash says so")
+	ed.file_save(true)
+	ok(ed.scene_name == "SCENE 002" and SceneFile.list().size() == 2, "SAVE AS NEW makes SCENE 002")
+	# Open the first again, after wiping the scene.
+	ed.file_new()
+	ok(ed.objects().is_empty(), "wiped")
+	_pen_tap(_row_center(ed.file_bar, 0))
+	await _settle()
+	ok(ed.popover.visible and ed.file_menu.index_of("open:SCENE 001") >= 0, "FILE lists the saved scenes")
+	var row: Vector2 = ed.file_menu.global_position + ed.file_menu.row_rect(ed.file_menu.index_of("open:SCENE 001")).get_center()
+	_pen_tap(row)
+	await _settle()
+	ok(ed.objects().size() == 2 and ed.scene_name == "SCENE 001" and not ed.is_dirty(), "a tap opens SCENE 001, clean")
+	var c2: Node3D = ed.objects()[0]
+	ok(c2.position.is_equal_approx(Vector3(1, 2, 3)) and c2.child_objects().size() == 1, "where it was, with its child")
+	ok(c2.data.face_count() == 6, "and its mesh")
+	ed.undo()
+	ok(ed.objects().is_empty(), "undo goes back to the scene before opening")
+	ed.redo()
+	# Export.
+	var dir := OS.get_user_data_dir().path_join("test_exports")
+	ed.export_dir_override = dir
+	var path: String = ed.file_export()
+	ok(path.ends_with("SCENE_001.obj") and FileAccess.file_exists(path), "EXPORT OBJ writes a file (%s)" % path)
+	var text := FileAccess.get_file_as_string(path)
+	ok(text.count("\nv ") == 8 + 114 and text.count("\nf ") == 6 + 128, "with every vertex and face (%d v, %d f)" % [text.count("\nv "), text.count("\nf ")])
+	ok(text.contains("v 0.000000 1.000000 2.000000") or text.contains("v 0.000000 3.000000 2.000000"),
+			"in world space")
+	for n in SceneFile.list():
+		SceneFile.delete(n)

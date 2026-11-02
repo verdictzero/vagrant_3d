@@ -771,3 +771,175 @@ func _bevel_fill_holes(bev: Dictionary, first_new: int) -> void:
 				break
 		if closed and loop.size() >= 3:
 			add_face(loop)
+
+
+# --- loop cut ----------------------------------------------------------------------
+#
+# One cut across a ring of quads, from a picked edge: walk across each quad to
+# its opposite edge, both ways, until the ring closes or meets a face that is
+# not a quad (or the mesh's border). Every ring edge gets a new vertex, every
+# quad crossed splits in two, and a non-quad at an open ring's end gains the
+# vertex on its edge. FACTOR slides the cut from one side of the ring (-1) to
+# the other (+1), every vertex the same way.
+
+func loopcut_begin(edge: int) -> Dictionary:
+	if edge < 0 or edge >= edges.size():
+		return {}
+	var efm := edge_face_map()
+	var start: Vector2i = edges[edge]
+	var ring: Array = [[start.x, start.y]]   # oriented: [p, q], p ends all on one side
+	var crossed := {}                         # face -> [ring key, ring key]
+	var closed := false
+	var sides: Array = efm[start]
+	for side in sides.size():
+		if closed:
+			break
+		var p := start.x
+		var q := start.y
+		var f: int = sides[side]
+		while true:
+			if crossed.has(f) or faces[f].size() != 4:
+				break
+			var idx := faces[f]
+			var ip := idx.find(p)
+			# The neighbours of p and q that are not each other: the far edge.
+			var p2: int = idx[(ip + 3) % 4] if idx[(ip + 1) % 4] == q else idx[(ip + 1) % 4]
+			var iq := idx.find(q)
+			var q2: int = idx[(iq + 3) % 4] if idx[(iq + 1) % 4] == p else idx[(iq + 1) % 4]
+			var here := Vector2i(mini(p, q), maxi(p, q))
+			var far := Vector2i(mini(p2, q2), maxi(p2, q2))
+			crossed[f] = [here, far]
+			if far == start:
+				closed = true
+				break
+			if side == 0:
+				ring.append([p2, q2])
+			else:
+				ring.push_front([p2, q2])
+			var nf := -1
+			for g in efm[far]:
+				if g != f:
+					nf = g
+			if nf < 0:
+				break
+			p = p2
+			q = q2
+			f = nf
+	if crossed.is_empty():
+		return {}
+	var cut := {}   # ring key -> new vertex
+	var moving := PackedInt32Array()
+	var base := PackedVector3Array()
+	var dir := PackedVector3Array()
+	var limit := PackedFloat32Array()
+	var sel := {}
+	for pq in ring:
+		var a: int = pq[0]
+		var b: int = pq[1]
+		var key := Vector2i(mini(a, b), maxi(a, b))
+		if cut.has(key):
+			continue
+		var mid := (verts[a] + verts[b]) * 0.5
+		var nv := add_vert(mid)
+		cut[key] = nv
+		moving.append(nv)
+		base.append(mid)
+		dir.append((verts[b] - verts[a]) * 0.5)
+		limit.append(0.98)
+		sel[nv] = true
+	var new_faces: Array[PackedInt32Array] = []
+	for f in faces.size():
+		var idx := faces[f]
+		var n := idx.size()
+		if crossed.has(f):
+			var e1: Vector2i = crossed[f][0]
+			for i in 4:
+				var a := idx[i]
+				var b := idx[(i + 1) % 4]
+				if Vector2i(mini(a, b), maxi(a, b)) == e1:
+					var c := idx[(i + 2) % 4]
+					var d := idx[(i + 3) % 4]
+					var m1: int = cut[e1]
+					var m2: int = cut[Vector2i(mini(c, d), maxi(c, d))]
+					new_faces.append(PackedInt32Array([a, m1, m2, d]))
+					new_faces.append(PackedInt32Array([m1, b, c, m2]))
+					break
+		else:
+			var nf := PackedInt32Array()
+			for i in n:
+				var a := idx[i]
+				var b := idx[(i + 1) % n]
+				nf.append(a)
+				var key := Vector2i(mini(a, b), maxi(a, b))
+				if cut.has(key):
+					nf.append(cut[key])
+			new_faces.append(nf)
+	faces = []
+	edges = []
+	_edge_index = {}
+	for nf in new_faces:
+		add_face(nf)
+	return {"moving": moving, "base": base, "dir": dir, "limit": limit, "sel_verts": sel}
+
+
+# --- duplicate ---------------------------------------------------------------------
+
+## Copy the selected part: faces whose every vertex is selected, edges whose
+## two are, and the vertices themselves. Returns the copies' vertices.
+func duplicate_selection(sel_v: Dictionary) -> Dictionary:
+	var map := {}
+	for v in sel_v:
+		map[v] = add_vert(verts[v])
+	var face_count := faces.size()
+	for f in face_count:
+		var all := true
+		for i in faces[f]:
+			if not map.has(i):
+				all = false
+				break
+		if all:
+			var nf := PackedInt32Array()
+			for i in faces[f]:
+				nf.append(map[i])
+			add_face(nf)
+	for e in edges.duplicate():
+		if map.has(e.x) and map.has(e.y):
+			_add_edge(map[e.x], map[e.y])
+	var out := {}
+	for v in map:
+		out[map[v]] = true
+	return out
+
+
+# --- files ---------------------------------------------------------------------------
+
+## Plain data for a scene file: verts as a flat array, faces as index lists,
+## and any edge no face uses.
+func to_dict() -> Dictionary:
+	var flat := []
+	for v in verts:
+		flat.append_array([v.x, v.y, v.z])
+	var fs := []
+	for f in faces:
+		fs.append(Array(f))
+	var efm := edge_face_map()
+	var wires := []
+	for e in efm:
+		if efm[e].is_empty():
+			wires.append([e.x, e.y])
+	return {"verts": flat, "faces": fs, "wires": wires}
+
+
+static func from_dict(d: Dictionary) -> MeshData:
+	var m := MeshData.new()
+	var flat: Array = d.get("verts", [])
+	for i in range(0, flat.size() - 2, 3):
+		m.add_vert(Vector3(flat[i], flat[i + 1], flat[i + 2]))
+	for f in d.get("faces", []):
+		var idx := PackedInt32Array()
+		for i in f:
+			idx.append(int(i))
+		m.add_face(idx)
+	for w in d.get("wires", []):
+		m._add_edge(int(w[0]), int(w[1]))
+	return m

@@ -18,6 +18,7 @@ const Overlay := preload("res://scripts/SCRIPT_viewport_overlay.gd")
 const Grid := preload("res://scripts/SCRIPT_matcap_grid.gd")
 const ToolWin := preload("res://scripts/SCRIPT_tool_window.gd")
 const Gizmo := preload("res://scripts/SCRIPT_nav_gizmo.gd")
+const XGizmo := preload("res://scripts/SCRIPT_transform_gizmo.gd")
 
 enum Mode { OBJECT, EDIT }
 enum Elem { VERT, EDGE, FACE }
@@ -35,16 +36,16 @@ const TAP_TIME := 0.35
 const POPOVER_W := 272.0
 
 const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
-const TOOLS := ["TRANSLATE", "ROTATE", "SCALE", "EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL"]
-const MESH_TOOLS := ["EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL"]
+const TOOLS := ["TRANSLATE", "ROTATE", "SCALE", "EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL", "LOOP CUT"]
+const MESH_TOOLS := ["EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL", "LOOP CUT"]
 ## The tool column, per mode, in Blender's order. SELECT and MOVE are
 ## pointers; the rest are tools.
 const TOOLBAR := {
 	Mode.OBJECT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
-		["DELETE", &"delete"]],
+		["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
 	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
 		["EXTRUDE", &"extrude"], ["EXTRUDE NORMALS", &"extrude_normals"], ["INSET", &"inset"],
-		["BEVEL", &"bevel"], ["DELETE", &"delete"]],
+		["BEVEL", &"bevel"], ["LOOP CUT", &"loopcut"], ["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
 }
 const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
 const ROT_DEG_PER_PX := 0.5
@@ -103,6 +104,24 @@ var history: Array = []
 var history_index := -1
 var _before: Dictionary = {}
 var _scrub_start := 0.0
+var _snap_counter := 0
+
+# The file this scene was last saved to or opened from ("" until then), and
+# which history step that was, so the status can say when it has changed.
+var scene_name := ""
+var _saved_id := -1
+var export_dir_override := ""   # tests write OBJ here instead of Documents
+
+# A line of text over the view that fades: "SAVED SCENE 001".
+var flash_text := ""
+var flash_until := 0
+
+# The transform gizmo, and a drag on one of its handles.
+var xgizmo := XGizmo.new()
+var gizmo_hover := ""
+var _giz: Dictionary = {}       # {id, from, start, t0, p0, axis}
+var _pen_gizmo := false
+var _finger_gizmo := false
 
 # --- nodes -------------------------------------------------------------------
 
@@ -125,6 +144,10 @@ var toggle_list: RowList
 var gizmo: NavGizmo
 var proj_list: RowList
 var history_bar: RowList
+var file_bar: RowList
+var file_menu: RowList
+var select_bar: RowList
+var select_menu: RowList
 var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
@@ -163,6 +186,7 @@ func _ready() -> void:
 	get_viewport().size_changed.connect(_layout)
 	_layout()
 	push_undo("START")
+	_saved_id = history[history_index].id
 	_refresh_lists()
 
 
@@ -248,11 +272,13 @@ func _build_ui() -> void:
 	toolbar.tapped.connect(_on_toolbar_tapped)
 	ui.add_child(toolbar)
 
+	file_bar = _bar([{"id": "FILE", "text": "FILE", "icon": &"file"}], _on_toggle_tapped)
 	mode_list = _bar([{"id": "OBJECT", "text": "OBJECT", "icon": &"object"},
 			{"id": "EDIT", "text": "EDIT", "icon": &"edit"}], _on_mode_tapped)
 	elem_list = _bar([{"id": "VERT", "text": "VERT", "icon": &"vert"},
 			{"id": "EDGE", "text": "EDGE", "icon": &"edge"},
 			{"id": "FACE", "text": "FACE", "icon": &"face"}], _on_elem_tapped)
+	select_bar = _bar([{"id": "SELECT", "text": "SELECT", "icon": &"select_box"}], _on_toggle_tapped)
 	add_bar = _bar([{"id": "ADD", "text": "ADD", "icon": &"add"}], _on_toggle_tapped)
 	toggle_list = _bar([{"id": "SNAP", "text": "SNAP", "icon": &"snap", "lit": true},
 			{"id": "SHADING", "text": "SHADING", "icon": &"shading"}], _on_toggle_tapped)
@@ -288,6 +314,17 @@ func _build_ui() -> void:
 	add_menu.tapped.connect(_on_add_tapped)
 	add_menu.visible = false
 	ui.add_child(add_menu)
+	file_menu = Rows.new()
+	file_menu.tapped.connect(_on_file_tapped)
+	file_menu.visible = false
+	ui.add_child(file_menu)
+	select_menu = Rows.new()
+	select_menu.set_items([{"id": "ALL", "text": "ALL"}, {"id": "NONE", "text": "NONE"},
+			{"id": "INVERT", "text": "INVERT"}])
+	select_menu.tapped.connect(_on_select_tapped)
+	select_menu.visible = false
+	ui.add_child(select_menu)
+	xgizmo.camera = camera()
 	matcap_grid = Grid.new()
 	matcap_grid.picked.connect(_on_matcap_picked)
 	matcap_grid.visible = false
@@ -342,7 +379,7 @@ func _layout() -> void:
 	top_panel.size = Vector2(rx - T.GUTTER - m, BAR_H)
 	var ry := m + 6.0
 	var x := m + 6.0
-	for l in [mode_list, elem_list, add_bar]:
+	for l in [file_bar, mode_list, elem_list, select_bar, add_bar]:
 		l.position = Vector2(x, ry)
 		l.size = l.content_size()
 		x += l.size.x + T.GUTTER
@@ -385,8 +422,10 @@ func _refresh_lists() -> void:
 	elem_list.set_active(["VERT", "EDGE", "FACE"][elem] if mode == Mode.EDIT else null)
 	_refresh_toolbar()
 	toggle_list.items[0].lit = snap_on
-	toggle_list.set_active(popover_kind if popover.visible and popover_kind != "ADD" else null)
-	add_bar.set_active("ADD" if popover.visible and popover_kind == "ADD" else null)
+	toggle_list.set_active(popover_kind if popover.visible and popover_kind in ["SNAP", "SHADING"] else null)
+	for bar in [add_bar, file_bar, select_bar]:
+		var bid: String = bar.items[0].id
+		bar.set_active(bid if popover.visible and popover_kind == bid else null)
 	proj_list.items[0].lit = orbit.ortho
 	proj_list.set_active(null)
 	history_bar.items[0].disabled = not can_undo()
@@ -397,6 +436,7 @@ func _refresh_lists() -> void:
 	toggle_list.queue_redraw()
 	proj_list.queue_redraw()
 	_refresh_snap_menu()
+	_refresh_file_menu()
 	_refresh_props()
 
 
@@ -410,7 +450,7 @@ func _refresh_toolbar() -> void:
 		var dis := false
 		match id:
 			"SELECT", "MOVE": dis = false
-			"DELETE": dis = not can_delete
+			"DELETE", "DUPLICATE": dis = not can_delete
 			_: dis = not tool_available(id) and not (tool_live() and tool_kind() == id)
 		items.append({"id": id, "text": id, "icon": entry[1], "disabled": dis})
 	toolbar.set_items(items)
@@ -536,7 +576,8 @@ func _collect(n: Node, out: Array[SceneObject]) -> void:
 
 func status_words() -> String:
 	var view := orbit.view_name()
-	var words: String = (view if view != "" else "USER") + (" ORTHO" if orbit.ortho else " PERSP")
+	var words: String = (scene_name if scene_name != "" else "UNTITLED") + ("*" if is_dirty() else "") + "    "
+	words += (view if view != "" else "USER") + (" ORTHO" if orbit.ortho else " PERSP")
 	words += "    " + ("OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem])
 	if active_object != null:
 		words += "    " + active_object.name
@@ -572,7 +613,11 @@ func open_popover(kind: String) -> void:
 	popover.visible = true
 	snap_menu.visible = kind == "SNAP"
 	add_menu.visible = kind == "ADD"
+	file_menu.visible = kind == "FILE"
+	select_menu.visible = kind == "SELECT"
 	matcap_grid.visible = kind == "SHADING"
+	if kind == "FILE":
+		_refresh_file_menu()
 	_refresh_snap_menu()
 	matcap_grid.set_active(SceneObject.matcap_index)
 	_place_popover()
@@ -585,6 +630,8 @@ func close_popover() -> void:
 	popover.visible = false
 	snap_menu.visible = false
 	add_menu.visible = false
+	file_menu.visible = false
+	select_menu.visible = false
 	matcap_grid.visible = false
 	_refresh_lists()
 
@@ -593,16 +640,19 @@ func _place_popover() -> void:
 	if not popover.visible:
 		return
 	var anchor: Vector2
-	if popover_kind == "ADD":
-		anchor = add_bar.position
-	else:
-		var i := toggle_list.index_of(popover_kind)
-		anchor = toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
+	match popover_kind:
+		"ADD": anchor = add_bar.position
+		"FILE": anchor = file_bar.position
+		"SELECT": anchor = select_bar.position
+		_:
+			var i := toggle_list.index_of(popover_kind)
+			anchor = toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
 	var top := view_rect.position.y - 2.0
-	if popover_kind == "SNAP" or popover_kind == "ADD":
-		var menu: RowList = snap_menu if popover_kind == "SNAP" else add_menu
+	var menu: RowList = _menu_for(popover_kind)
+	if menu != null:
 		menu.size = Vector2(POPOVER_W - 8.0, 0.0)
-		var h: float = menu.content_size().y
+		# A long menu (the saved scenes) scrolls inside the view's height.
+		var h: float = minf(menu.content_size().y, view_rect.size.y - 40.0)
 		popover.size = Vector2(POPOVER_W, h + 16.0)
 		popover.position = Vector2(clampf(anchor.x, view_rect.position.x, view_rect.end.x - POPOVER_W), top)
 		menu.position = popover.position + Vector2(4.0, 8.0)
@@ -612,6 +662,15 @@ func _place_popover() -> void:
 		popover.size = g + Vector2(T.PAD * 2, T.PAD * 2)
 		popover.position = Vector2(minf(anchor.x, view_rect.end.x - popover.size.x), top)
 		matcap_grid.position = popover.position + Vector2(T.PAD, T.PAD)
+
+
+func _menu_for(kind: String) -> RowList:
+	match kind:
+		"SNAP": return snap_menu
+		"ADD": return add_menu
+		"FILE": return file_menu
+		"SELECT": return select_menu
+	return null
 
 
 func _refresh_snap_menu() -> void:
@@ -692,12 +751,206 @@ func _on_toolbar_tapped(id: Variant) -> void:
 			pointer = Pointer.MOVE
 		"DELETE":
 			delete_selected()
+		"DUPLICATE":
+			duplicate_selected()
 		_:
 			pointer = Pointer.TOOL
 			current_tool = id
 			if not (tool_live() and tool_kind() == id):
 				tool_start(id)
 	_refresh_lists()
+
+
+# --- file and select menus --------------------------------------------------------
+
+func _refresh_file_menu() -> void:
+	if file_menu == null:
+		return
+	var rows: Array[Dictionary] = [
+		{"id": "NEW", "text": "NEW"},
+		{"id": "SAVE", "text": "SAVE", "value": scene_name if scene_name != "" else "NEW FILE"},
+		{"id": "SAVE AS", "text": "SAVE AS NEW", "disabled": scene_name == ""},
+	]
+	var saved := SceneFile.list()
+	rows.append({"id": "_open", "text": "OPEN", "heading": true})
+	if saved.is_empty():
+		rows.append({"id": "_none", "text": "NOTHING SAVED YET", "inert": true, "disabled": true})
+	for n in saved:
+		rows.append({"id": "open:" + n, "text": n, "on": n == scene_name})
+	rows.append({"id": "_export", "text": "EXPORT", "heading": true})
+	rows.append({"id": "OBJ", "text": "EXPORT OBJ"})
+	file_menu.set_items(rows)
+
+
+func _on_file_tapped(id: Variant) -> void:
+	close_popover()
+	match id:
+		"NEW": file_new()
+		"SAVE": file_save(false)
+		"SAVE AS": file_save(true)
+		"OBJ": file_export()
+		_:
+			if String(id).begins_with("open:"):
+				file_open(String(id).substr(5))
+
+
+func _on_select_tapped(id: Variant) -> void:
+	close_popover()
+	select_all(String(id))
+
+
+func is_dirty() -> bool:
+	return history_index >= 0 and history[history_index].get("id", -1) != _saved_id
+
+
+func flash(text: String, seconds := 2.5) -> void:
+	flash_text = text
+	flash_until = Time.get_ticks_msec() + int(seconds * 1000.0)
+
+
+## An empty scene, as one undo step.
+func file_new() -> void:
+	_tool_finish()
+	_mark_before()
+	_restore({"objects": [], "sel": [], "active": -1, "mode": Mode.OBJECT, "elem": elem,
+			"sv": {}, "se": {}, "sf": {}, "scene": ""})
+	push_undo("NEW")
+	_saved_id = history[history_index].id
+	flash("NEW SCENE")
+
+
+## Save to this scene's file, or to a new numbered one.
+func file_save(as_new: bool) -> bool:
+	_tool_finish()
+	var fname := scene_name if scene_name != "" and not as_new else SceneFile.next_name()
+	if not SceneFile.save(fname, _snapshot(), SceneObject.matcap_index):
+		flash("COULD NOT SAVE " + fname)
+		return false
+	scene_name = fname
+	history[history_index].scene = fname
+	_saved_id = history[history_index].id
+	flash("SAVED " + fname)
+	_refresh_lists()
+	return true
+
+
+## Open a saved scene, as one undo step (the scene before is an undo away).
+func file_open(fname: String) -> bool:
+	var data := SceneFile.load_scene(fname)
+	if data.is_empty():
+		flash("COULD NOT OPEN " + fname)
+		return false
+	_tool_finish()
+	_mark_before()
+	_restore({"objects": data.objects, "sel": [], "active": -1, "mode": Mode.OBJECT, "elem": elem,
+			"sv": {}, "se": {}, "sf": {}, "scene": fname})
+	SceneObject.set_matcap(data.matcap)
+	push_undo("OPEN")
+	_saved_id = history[history_index].id
+	flash("OPENED " + fname)
+	return true
+
+
+func file_export() -> String:
+	_tool_finish()
+	var path := SceneFile.export_obj(scene_name if scene_name != "" else "untitled", objects(), export_dir_override)
+	flash("EXPORTED " + path if path != "" else "COULD NOT EXPORT", 4.0)
+	return path
+
+
+## ALL, NONE or INVERT: objects in OBJECT mode, the element kind in EDIT.
+func select_all(how: String) -> void:
+	_tool_finish()
+	if mode == Mode.OBJECT:
+		var all := objects()
+		var pick: Array[SceneObject] = []
+		match how:
+			"ALL": pick = all
+			"INVERT":
+				for o in all:
+					if not sel_objects.has(o):
+						pick.append(o)
+		sel_objects = pick
+		if not sel_objects.has(active_object):
+			active_object = sel_objects[0] if not sel_objects.is_empty() else null
+		_clear_elems()
+		_refresh_lists()
+		return
+	if active_object == null:
+		return
+	var d := active_object.data
+	var n: int = [d.vert_count(), d.edge_count(), d.face_count()][elem]
+	var have: Dictionary = [sel_verts, sel_edges, sel_faces][elem]
+	var want := {}
+	for i in n:
+		if how == "ALL" or (how == "INVERT" and not have.has(i)):
+			want[i] = true
+	match elem:
+		Elem.VERT: select_verts(want)
+		Elem.EDGE: select_edges(want)
+		_: select_faces(want)
+
+
+## Copy the selection in place and leave MOVE as the pointer, so the next
+## drag moves the copy: objects with their children, or the selected part of
+## the mesh in EDIT.
+func duplicate_selected() -> void:
+	_tool_finish()
+	if not has_moveable():
+		return
+	_mark_before()
+	if mode == Mode.OBJECT:
+		var copies: Array[SceneObject] = []
+		var new_active: SceneObject = null
+		for o in _move_roots():
+			var c := _clone(o)
+			o.get_parent().add_child(c)
+			c.transform = o.transform
+			_rename_copies(c)
+			copies.append(c)
+			if active_object != null and (o == active_object or active_object.is_descendant_of(o)):
+				new_active = c
+		sel_objects = copies
+		active_object = new_active if new_active != null else copies[0]
+	else:
+		var made := active_object.data.duplicate_selection(sel_verts)
+		active_object.rebuild()
+		select_verts(made)
+	push_undo("DUPLICATE")
+	pointer = Pointer.MOVE
+	_refresh_lists()
+
+
+var _clone_n := 0
+
+
+func _clone(o: SceneObject) -> SceneObject:
+	_clone_n += 1
+	var c: SceneObject
+	if o.is_group:
+		c = SceneObject.create_group("~%d" % _clone_n)
+	else:
+		c = SceneObject.create("~%d" % _clone_n, o.data.copy())
+	c.set_meta("base", _base_name(String(o.name)))
+	for child in o.child_objects():
+		var cc := _clone(child)
+		c.add_child(cc)
+		cc.transform = child.transform
+	return c
+
+
+func _rename_copies(c: SceneObject) -> void:
+	c.name = _unique_name(c.get_meta("base"))
+	for child in c.child_objects():
+		_rename_copies(child)
+
+
+## "Cube 003" -> "Cube".
+static func _base_name(n: String) -> String:
+	var parts := n.rsplit(" ", true, 1)
+	if parts.size() == 2 and parts[1].length() == 3 and parts[1].is_valid_int():
+		return parts[0]
+	return n
 
 
 func _on_history_tapped(id: Variant) -> void:
@@ -761,7 +1014,7 @@ func tool_available(kind: String) -> bool:
 			return mode == Mode.EDIT and active_object != null and not sel_verts.is_empty()
 		"INSET":
 			return mode == Mode.EDIT and active_object != null and not sel_faces.is_empty()
-		"BEVEL":
+		"BEVEL", "LOOP CUT":
 			return mode == Mode.EDIT and active_object != null and not sel_edges.is_empty()
 	return false
 
@@ -800,6 +1053,7 @@ func tool_start(kind: String = current_tool) -> bool:
 		match kind:
 			"INSET": mj = d.inset_begin(sel_faces)
 			"BEVEL": mj = d.bevel_begin(sel_edges)
+			"LOOP CUT": mj = d.loopcut_begin(sel_edges.keys()[0])
 			_: mj = d.extrude_begin(sel_verts, sel_edges, sel_faces, kind == "EXTRUDE NORMALS")
 		if mj.is_empty():
 			active_object.data = backup
@@ -810,6 +1064,7 @@ func tool_start(kind: String = current_tool) -> bool:
 		match kind:
 			"INSET": job.props = [_prop("THICKNESS", 0.0, 1.0, 0.0, "", 2), _prop("DEPTH", -1.0, 1.0, 0.0, "", 2)]
 			"BEVEL": job.props = [_prop("AMOUNT", 0.0, 1.0, 0.0, "", 2)]
+			"LOOP CUT": job.props = [_prop("FACTOR", -1.0, 1.0, 0.0, "", 2)]
 			_: job.props = [_prop("AMOUNT", -2.0, 2.0, 0.0, "", 2)]
 		active_object.rebuild()
 		tool_job = job
@@ -894,6 +1149,7 @@ func _tool_snap(v: float) -> float:
 		"ROTATE": return snappedf(v, ROT_STEP)
 		"SCALE": return snappedf(v, SCALE_STEP)
 		"INSET", "BEVEL": return snappedf(v, snap_step * 0.2)
+		"LOOP CUT": return snappedf(v, 0.1)
 	return snappedf(v, snap_step)
 
 
@@ -1032,6 +1288,8 @@ func _tool_drag_update(pos: Vector2) -> void:
 			tool_set(0, _tool_drag_from[0] + length)
 		"INSET":
 			tool_set(0, _tool_drag_from[0] + length * 0.5)
+		"LOOP CUT":
+			tool_set(0, _tool_drag_from[0] + dx / 200.0)
 		"ROTATE":
 			var fwd := camera().global_basis.z.abs()
 			var axis := 0 if fwd.x >= fwd.y and fwd.x >= fwd.z else (1 if fwd.y >= fwd.z else 2)
@@ -1068,6 +1326,8 @@ func push_undo(label: String) -> void:
 	history.resize(history_index + 1)
 	var snap := _snapshot()
 	snap.label = label
+	_snap_counter += 1
+	snap.id = _snap_counter
 	history.append(snap)
 	while history.size() > HISTORY_MAX:
 		history.pop_front()
@@ -1127,6 +1387,7 @@ func _snapshot() -> Dictionary:
 				"xf": o.transform, "data": o.data.copy()})
 	var snap := _selection_state()
 	snap.objects = recs
+	snap.scene = scene_name
 	return snap
 
 
@@ -1160,6 +1421,7 @@ func _restore(snap: Dictionary) -> void:
 	sel_verts = snap.sv.duplicate()
 	sel_edges = snap.se.duplicate()
 	sel_faces = snap.sf.duplicate()
+	scene_name = snap.get("scene", scene_name)
 	_refresh_lists()
 
 
@@ -1518,6 +1780,12 @@ func box_select(rect: Rect2) -> void:
 			select_faces(fs)
 
 
+func _clear_hover() -> void:
+	hover_object = null
+	hover_kind = -1
+	hover_index = -1
+
+
 func update_hover(pos: Vector2, radius: float) -> void:
 	hover_object = null
 	hover_kind = -1
@@ -1529,6 +1797,136 @@ func update_hover(pos: Vector2, radius: float) -> void:
 	elif active_object != null:
 		hover_index = pick_elem(pos, radius)
 		hover_kind = elem if hover_index >= 0 else -1
+
+
+# --- the transform gizmo -------------------------------------------------------
+#
+# Shown at the selection's pivot while MOVE is the pointer (arrows), or the
+# ROTATE (rings) or SCALE (handles) tool is. A press on a handle wins over
+# picking: an arrow moves along its world axis, a ring turns about it, a
+# handle scales along it, the centre moves freely or scales evenly. The drag
+# runs the matching tool, so its numbers are in the tool window and it stays
+# live, like any other.
+
+func gizmo_kind() -> String:
+	if box_active or not (has_moveable() or (tool_live() and tool_kind() in ["TRANSLATE", "ROTATE", "SCALE"])):
+		return ""
+	if pointer == Pointer.MOVE:
+		return "MOVE"
+	if pointer == Pointer.TOOL and current_tool in ["ROTATE", "SCALE"]:
+		return current_tool
+	return ""
+
+
+## Where the selection's centre is now, a live move included.
+func selection_pivot() -> Vector3:
+	if tool_live() and tool_job.has("pivot"):
+		var p: Vector3 = tool_job.pivot
+		if tool_kind() == "TRANSLATE":
+			var v := tool_values()
+			p += Vector3(v[0], v[1], v[2])
+		return p
+	var pivot := Vector3.ZERO
+	if mode == Mode.OBJECT:
+		var roots := _move_roots()
+		if roots.is_empty():
+			return pivot
+		for o in roots:
+			pivot += o.global_position
+		return pivot / float(roots.size())
+	if active_object == null or sel_verts.is_empty():
+		return pivot
+	for i in sel_verts:
+		pivot += active_object.global_transform * active_object.data.verts[i]
+	return pivot / float(sel_verts.size())
+
+
+func _gizmo_sync() -> void:
+	xgizmo.kind = gizmo_kind()
+	if xgizmo.kind != "":
+		xgizmo.pivot = selection_pivot()
+		xgizmo.viewport_h = get_viewport().get_visible_rect().size.y
+
+
+func gizmo_pick(pos: Vector2, radius: float) -> String:
+	_gizmo_sync()
+	if not view_rect.has_point(pos):
+		return ""
+	return xgizmo.pick(pos, radius)
+
+
+func gizmo_draw(ci: CanvasItem) -> void:
+	_gizmo_sync()
+	xgizmo.draw(ci, gizmo_hover, _giz.get("id", ""))
+
+
+func gizmo_begin(id: String, pos: Vector2) -> bool:
+	var kind := xgizmo.kind
+	var tk: String = {"MOVE": "TRANSLATE", "ROTATE": "ROTATE", "SCALE": "SCALE"}[kind]
+	if not (tool_live() and tool_kind() == tk) and not tool_start(tk):
+		return false
+	_giz = {"id": id, "kind": kind, "from": tool_values(), "start": pos,
+			"p0": camera().unproject_position(selection_pivot()), "pivot": selection_pivot()}
+	if id == "C":
+		_tool_drag_begin(pos)
+	elif kind == "MOVE":
+		var i := "XYZ".find(id)
+		_giz.axis = XGizmo.AXES[i]
+		_giz.t0 = _axis_param(pos, _giz.axis, _giz.pivot)
+	return true
+
+
+func gizmo_update(pos: Vector2) -> void:
+	if _giz.is_empty() or not tool_live():
+		return
+	var id: String = _giz.id
+	if id == "C":
+		_tool_drag_update(pos)
+		return
+	var i := "XYZ".find(id)
+	var from: Array = _giz.from
+	match _giz.kind:
+		"MOVE":
+			var axis: Vector3 = _giz.axis
+			var d := _axis_param(pos, axis, _giz.pivot) - float(_giz.t0)
+			var v := Vector3(from[0], from[1], from[2]) + axis * d
+			if snap_on and snap_targets.INCREMENT:
+				var base: Vector3 = tool_job.pivot
+				v[i] = (snappedf(base[i] + v[i], snap_step) - base[i]) if snap_absolute else snappedf(v[i], snap_step)
+			tool_set_vector(v)
+		"ROTATE":
+			var p0: Vector2 = _giz.p0
+			var a := wrapf((pos - p0).angle() - (_giz.start - p0).angle(), -PI, PI)
+			var facing: bool = XGizmo.AXES[i].dot(camera().global_basis.z) > 0.0
+			var deg := -rad_to_deg(a) * (1.0 if facing else -1.0)
+			tool_set(i, float(from[i]) + deg)
+		"SCALE":
+			var p0: Vector2 = _giz.p0
+			var sh := xgizmo.shaft(i)
+			if sh.is_empty():
+				return
+			var dir: Vector2 = ((sh[1] as Vector2) - p0).normalized()
+			var s0 := maxf((_giz.start - p0).dot(dir), 10.0)
+			var k := (pos - p0).dot(dir) / s0
+			tool_set(i, float(from[i]) * k)
+
+
+func gizmo_end() -> void:
+	_giz = {}
+	snap_hit = {}
+
+
+## Where along the line `origin + axis * t` the pointer's ray passes closest.
+func _axis_param(pos: Vector2, axis: Vector3, origin: Vector3) -> float:
+	var r := _ray(pos)
+	var o: Vector3 = r[0]
+	var d: Vector3 = r[1]
+	var w0 := origin - o
+	var b := axis.dot(d)
+	var den := 1.0 - b * b
+	if den < 1e-4:
+		return 0.0
+	return (b * d.dot(w0) - axis.dot(w0)) / den
 
 
 # --- moving --------------------------------------------------------------------
@@ -1686,7 +2084,9 @@ func _input(event: InputEvent) -> void:
 			press_pos = click.position
 		if press_pos != null and not popover.get_rect().has_point(press_pos) \
 				and not toggle_list.get_rect().has_point(press_pos) \
-				and not add_bar.get_rect().has_point(press_pos):
+				and not add_bar.get_rect().has_point(press_pos) \
+				and not file_bar.get_rect().has_point(press_pos) \
+				and not select_bar.get_rect().has_point(press_pos):
 			close_popover()
 			get_viewport().set_input_as_handled()
 			return
@@ -1754,16 +2154,26 @@ func _key(k: InputEventKey) -> bool:
 				tool_start("TRANSLATE")
 			return true
 		KEY_R:
-			_on_toolbar_tapped("ROTATE")
+			if ctrl:
+				if mode == Mode.EDIT:
+					_on_toolbar_tapped("LOOP CUT")
+			else:
+				_on_toolbar_tapped("ROTATE")
 			return true
 		KEY_S:
-			_on_toolbar_tapped("SCALE")
+			if ctrl:
+				file_save(k.shift_pressed)
+			else:
+				_on_toolbar_tapped("SCALE")
 			return true
 		KEY_E:
 			if mode == Mode.EDIT:
 				_on_toolbar_tapped("EXTRUDE")
 				return true
 		KEY_I:
+			if ctrl:
+				select_all("INVERT")
+				return true
 			if mode == Mode.EDIT:
 				_on_toolbar_tapped("INSET")
 				return true
@@ -1777,6 +2187,22 @@ func _key(k: InputEventKey) -> bool:
 		KEY_A:
 			if k.shift_pressed:
 				open_popover("ADD")
+			elif k.alt_pressed:
+				select_all("NONE")
+			else:
+				select_all("ALL")
+			return true
+		KEY_D:
+			if k.shift_pressed:
+				duplicate_selected()
+				return true
+		KEY_N:
+			if ctrl:
+				file_new()
+				return true
+		KEY_O:
+			if ctrl:
+				open_popover("FILE")
 				return true
 		KEY_ENTER, KEY_KP_ENTER:
 			tool_apply()
@@ -1813,7 +2239,13 @@ func _touch(t: InputEventScreenTouch) -> void:
 			_gesture_t0 = Time.get_ticks_msec()
 			_gesture_max = 0
 			_gesture_moved = false
-		_touches[t.index] = {"pos": t.position, "start": t.position, "time": 0.0, "cancelled": false}
+			var hit := gizmo_pick(t.position, FINGER_RADIUS)
+			if hit != "" and gizmo_begin(hit, t.position):
+				_finger_gizmo = true
+		elif _finger_gizmo:
+			_finger_gizmo = false
+			gizmo_end()
+		_touches[t.index] = {"pos": t.position, "start": t.position, "time": 0.0, "cancelled": _finger_gizmo}
 		_gesture_max = maxi(_gesture_max, _touches.size())
 		if _touches.size() == 2:
 			for k in _touches:
@@ -1830,6 +2262,10 @@ func _touch(t: InputEventScreenTouch) -> void:
 		return
 	var info: Dictionary = _touches[t.index]
 	_touches.erase(t.index)
+	if _finger_gizmo and _touches.is_empty():
+		_finger_gizmo = false
+		gizmo_end()
+		return
 	if _touches.is_empty() and _gesture_max >= 2 and not _gesture_moved \
 			and Time.get_ticks_msec() - _gesture_t0 <= GESTURE_TAP_MS:
 		# Two fingers tapped together: undo. Three: redo.
@@ -1863,6 +2299,9 @@ func _touch_drag(d: InputEventScreenDrag) -> void:
 	if info.pos.distance_to(info.start) > TAP_SLOP * 1.5:
 		_gesture_moved = true
 	if _touches.size() == 1:
+		if _finger_gizmo:
+			gizmo_update(d.position)
+			return
 		if info.cancelled:
 			return
 		var moved: bool = info.pos.distance_to(info.start) > TAP_SLOP
@@ -1923,9 +2362,16 @@ func _pen_button(c: InputEventMouseButton) -> void:
 				_pen_dragging = false
 				_pen_moving = false
 				_pen_tooling = false
+				var hit := gizmo_pick(c.position, PEN_RADIUS)
+				if hit != "" and gizmo_begin(hit, c.position):
+					_pen_gizmo = true
+					_pen_dragging = true
 			elif _pen_down:
 				_pen_down = false
-				if _pen_moving:
+				if _pen_gizmo:
+					_pen_gizmo = false
+					gizmo_end()
+				elif _pen_moving:
 					move_end()
 				elif _pen_tooling:
 					_pen_tooling = false
@@ -1952,7 +2398,14 @@ func _pen_motion(m: InputEventMouseMotion) -> void:
 		_orbit(m.relative)
 		return
 	if not _pen_down:
-		update_hover(m.position, PEN_RADIUS)
+		gizmo_hover = gizmo_pick(m.position, PEN_RADIUS)
+		if gizmo_hover == "":
+			update_hover(m.position, PEN_RADIUS)
+		else:
+			_clear_hover()
+		return
+	if _pen_gizmo:
+		gizmo_update(m.position)
 		return
 	if not _pen_dragging:
 		if m.position.distance_to(_pen_start) <= TAP_SLOP:
