@@ -76,6 +76,12 @@ func _initialize() -> void:
 	ed.tool_set(0, -10.0)
 	await _frames(6)
 	_shot("rotate")
+	ed.tool_cancel()
+	ed.orbit.view_from_axis(Vector3.BACK)
+	ed.open_popover("ADD")
+	ed._refresh_lists()
+	await _frames(6)
+	_shot("front_add")
 	quit(0)
 
 

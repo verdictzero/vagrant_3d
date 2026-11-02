@@ -1,7 +1,8 @@
 extends Node3D
-## The editor. One screen: the mode bar across the top, the hierarchy down
-## the right, the 3D view under both. Objects, groups, primitives, the three
-## element modes, select and move, snapping, matcaps.
+## The editor, laid out the way Blender is: the header across the top, the
+## tool column down the left, the hierarchy over the properties down the
+## right, the view in the middle with the axes ball in its corner. Objects,
+## groups, primitives, the three element modes, tools, snapping, matcaps.
 ##
 ## Two pointers, told apart by event class:
 ##   fingers  InputEventScreenTouch/Drag   camera (1 orbits, 2 pan + pinch),
@@ -16,12 +17,15 @@ const Rows := preload("res://scripts/SCRIPT_row_list.gd")
 const Overlay := preload("res://scripts/SCRIPT_viewport_overlay.gd")
 const Grid := preload("res://scripts/SCRIPT_matcap_grid.gd")
 const ToolWin := preload("res://scripts/SCRIPT_tool_window.gd")
+const Gizmo := preload("res://scripts/SCRIPT_nav_gizmo.gd")
 
 enum Mode { OBJECT, EDIT }
 enum Elem { VERT, EDGE, FACE }
 enum Pointer { SELECT, MOVE, TOOL }
 
 const RIGHT_W := 250.0
+const LEFT_W := 48.0
+const TOOL_ROW := 44.0
 const BAR_H := T.ROW_H + 12.0
 const PEN_RADIUS := 12.0
 const FINGER_RADIUS := 24.0
@@ -33,6 +37,12 @@ const POPOVER_W := 272.0
 const PRIMITIVES := ["PLANE", "CUBE", "CYLINDER", "SPHERE"]
 const TOOLS := ["TRANSLATE", "ROTATE", "EXTRUDE", "EXTRUDE NORMALS"]
 const TOOLS_LATER := ["BEVEL", "INSET"]
+## The tool column, per mode. SELECT and MOVE are pointers; the rest are tools.
+const TOOLBAR := {
+	Mode.OBJECT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["DELETE", &"delete"]],
+	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["EXTRUDE", &"extrude"],
+		["EXTRUDE NORMALS", &"extrude_normals"], ["BEVEL", &"bevel"], ["INSET", &"inset"], ["DELETE", &"delete"]],
+}
 const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
 const ROT_DEG_PER_PX := 0.5
 const ROT_STEP := 5.0
@@ -86,18 +96,23 @@ var _tool_drag_origin := Vector2.ZERO
 @onready var ui: CanvasLayer = $UI
 
 var right_panel: ChamferPanel
+var props_panel: ChamferPanel
 var top_panel: ChamferPanel
+var left_panel: ChamferPanel
 var hierarchy: RowList
-var add_list: RowList
+var props_list: RowList
+var toolbar: RowList
 var mode_list: RowList
 var elem_list: RowList
-var pointer_list: RowList
+var add_bar: RowList
+var add_menu: RowList
 var toggle_list: RowList
+var gizmo: NavGizmo
+var proj_list: RowList
 var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
 var snap_menu: RowList
-var tool_menu: RowList
 var matcap_grid: MatcapGrid
 var tool_window: ToolWindow
 var _headings: Array[Label] = []
@@ -178,9 +193,20 @@ func _build_ui() -> void:
 	right_panel.cut_bottom_left = false
 	right_panel.cut_bottom_right = true
 	ui.add_child(right_panel)
+	props_panel = Chamfer.new()
+	props_panel.cut_top_left = true
+	props_panel.cut_top_right = false
+	props_panel.cut_bottom_left = false
+	props_panel.cut_bottom_right = true
+	ui.add_child(props_panel)
 	top_panel = Chamfer.new()
 	top_panel.cut_size = T.ROW_CUT
 	ui.add_child(top_panel)
+	left_panel = Chamfer.new()
+	left_panel.cut_size = T.ROW_CUT
+	left_panel.cut_top_right = false
+	left_panel.cut_bottom_right = true
+	ui.add_child(left_panel)
 
 	_headings.append(_heading("HIERARCHY"))
 	hierarchy = Rows.new()
@@ -189,29 +215,34 @@ func _build_ui() -> void:
 	hierarchy.drag_dropped.connect(_on_hierarchy_dropped)
 	ui.add_child(hierarchy)
 
-	_headings.append(_heading("ADD"))
-	add_list = Rows.new()
-	var adds: Array[Dictionary] = []
-	for p in PRIMITIVES:
-		adds.append({"id": p, "text": p, "icon": StringName(p.to_lower())})
-	adds.append({"id": "GROUP", "text": "GROUP", "icon": &"group"})
-	adds.append({"id": "DELETE", "text": "DELETE", "icon": &"delete"})
-	add_list.set_items(adds)
-	add_list.tapped.connect(_on_add_tapped)
-	ui.add_child(add_list)
+	_headings.append(_heading("PROPERTIES"))
+	props_list = Rows.new()
+	ui.add_child(props_list)
+
+	toolbar = Rows.new()
+	toolbar.icon_only = true
+	toolbar.row_h = TOOL_ROW
+	toolbar.tapped.connect(_on_toolbar_tapped)
+	ui.add_child(toolbar)
 
 	mode_list = _bar([{"id": "OBJECT", "text": "OBJECT", "icon": &"object"},
 			{"id": "EDIT", "text": "EDIT", "icon": &"edit"}], _on_mode_tapped)
 	elem_list = _bar([{"id": "VERT", "text": "VERT", "icon": &"vert"},
 			{"id": "EDGE", "text": "EDGE", "icon": &"edge"},
 			{"id": "FACE", "text": "FACE", "icon": &"face"}], _on_elem_tapped)
-	pointer_list = _bar([{"id": "SELECT", "text": "SELECT", "icon": &"select"},
-			{"id": "MOVE", "text": "MOVE", "icon": &"move"},
-			{"id": "TOOL", "text": "TOOL", "icon": &"tool"}], _on_pointer_tapped)
+	add_bar = _bar([{"id": "ADD", "text": "ADD", "icon": &"add"}], _on_toggle_tapped)
 	toggle_list = _bar([{"id": "SNAP", "text": "SNAP", "icon": &"snap", "lit": true},
 			{"id": "SHADING", "text": "SHADING", "icon": &"shading"}], _on_toggle_tapped)
 
-	# The popover: one frame that holds the snap menu or the matcap gallery.
+	gizmo = Gizmo.new()
+	gizmo.camera = camera()
+	gizmo.axis_tapped.connect(_on_gizmo_axis)
+	gizmo.orbited.connect(_orbit)
+	ui.add_child(gizmo)
+	proj_list = _bar([{"id": "ORTHO", "text": "ORTHO"}], _on_proj_tapped)
+
+	# The popover: one frame that holds the snap menu, the add menu or the
+	# matcap gallery.
 	popover = Chamfer.new()
 	popover.cut_size = T.ROW_CUT
 	popover.cut_top_right = false
@@ -220,28 +251,26 @@ func _build_ui() -> void:
 	ui.add_child(popover)
 	snap_menu = Rows.new()
 	snap_menu.tapped.connect(_on_snap_tapped)
-	snap_menu.position = Vector2(4.0, 8.0)
 	snap_menu.visible = false
 	ui.add_child(snap_menu)
-	tool_menu = Rows.new()
-	tool_menu.tapped.connect(_on_tool_tapped)
-	var tools: Array[Dictionary] = []
-	for t in TOOLS:
-		tools.append({"id": t, "text": t})
-	for t in TOOLS_LATER:
-		tools.append({"id": t, "text": t, "disabled": true})
-	tool_menu.set_items(tools)
-	tool_menu.visible = false
-	ui.add_child(tool_menu)
+	add_menu = Rows.new()
+	var adds: Array[Dictionary] = []
+	for prim in PRIMITIVES:
+		adds.append({"id": prim, "text": prim, "icon": StringName(prim.to_lower())})
+	adds.append({"id": "GROUP", "text": "GROUP", "icon": &"group"})
+	add_menu.set_items(adds)
+	add_menu.tapped.connect(_on_add_tapped)
+	add_menu.visible = false
+	ui.add_child(add_menu)
+	matcap_grid = Grid.new()
+	matcap_grid.picked.connect(_on_matcap_picked)
+	matcap_grid.visible = false
+	ui.add_child(matcap_grid)
 	tool_window = ToolWin.new()
 	tool_window.value_changed.connect(tool_set)
 	tool_window.applied.connect(tool_apply)
 	tool_window.cancelled.connect(tool_cancel)
 	ui.add_child(tool_window)
-	matcap_grid = Grid.new()
-	matcap_grid.picked.connect(_on_matcap_picked)
-	matcap_grid.visible = false
-	ui.add_child(matcap_grid)
 
 
 func _bar(items: Array[Dictionary], handler: Callable) -> RowList:
@@ -268,32 +297,44 @@ func _layout() -> void:
 	var s := get_viewport().get_visible_rect().size
 	var m := float(T.MARGIN)
 	var pad := float(T.PAD)
-	# Right column.
+	# Right column: the hierarchy over the properties, half each.
 	var rx := s.x - m - RIGHT_W
+	var col_h := s.y - m * 2.0
+	var half := (col_h - T.GUTTER) * 0.5
 	right_panel.position = Vector2(rx, m)
-	right_panel.size = Vector2(RIGHT_W, s.y - m * 2.0)
-	var add_h := add_list.items.size() * T.ROW_H
-	var add_head_y := s.y - m - pad - add_h - T.FS_LABEL - 6.0
-	_headings[1].position = Vector2(rx + pad, add_head_y)
-	add_list.position = Vector2(rx + 4.0, add_head_y + T.FS_LABEL + 6.0)
-	add_list.size = Vector2(RIGHT_W - 8.0, add_h)
+	right_panel.size = Vector2(RIGHT_W, half)
+	props_panel.position = Vector2(rx, m + half + T.GUTTER)
+	props_panel.size = Vector2(RIGHT_W, half)
 	_headings[0].position = Vector2(rx + pad, m + 10.0)
 	hierarchy.position = Vector2(rx + 4.0, m + 10.0 + T.FS_LABEL + 6.0)
-	hierarchy.size = Vector2(RIGHT_W - 8.0, add_head_y - 10.0 - hierarchy.position.y)
-	# Top bar, left of the column.
+	hierarchy.size = Vector2(RIGHT_W - 8.0, right_panel.position.y + right_panel.size.y - 10.0 - hierarchy.position.y)
+	_headings[1].position = Vector2(rx + pad, props_panel.position.y + 10.0)
+	props_list.position = Vector2(rx + 4.0, props_panel.position.y + 10.0 + T.FS_LABEL + 6.0)
+	props_list.size = Vector2(RIGHT_W - 8.0, props_panel.position.y + props_panel.size.y - 10.0 - props_list.position.y)
+	# Header, left of the column.
 	top_panel.position = Vector2(m, m)
 	top_panel.size = Vector2(rx - T.GUTTER - m, BAR_H)
 	var ry := m + 6.0
 	var x := m + 6.0
-	for l in [mode_list, elem_list, pointer_list]:
+	for l in [mode_list, elem_list, add_bar]:
 		l.position = Vector2(x, ry)
 		l.size = l.content_size()
 		x += l.size.x + T.GUTTER
 	toggle_list.size = toggle_list.content_size()
 	toggle_list.position = Vector2(top_panel.position.x + top_panel.size.x - 6.0 - toggle_list.size.x, ry)
-	# What is left is the view.
+	# Tool column, under the header.
 	var top := m + BAR_H + T.GUTTER
-	view_rect = Rect2(m, top, rx - T.GUTTER - m, s.y - top - m)
+	left_panel.position = Vector2(m, top)
+	left_panel.size = Vector2(LEFT_W, s.y - top - m)
+	toolbar.position = Vector2(m + 2.0, top + 6.0)
+	toolbar.size = Vector2(LEFT_W - 4.0, left_panel.size.y - 12.0)
+	# What is left is the view, with the axes ball in its top-right corner.
+	var vx := m + LEFT_W + T.GUTTER
+	view_rect = Rect2(vx, top, rx - T.GUTTER - vx, s.y - top - m)
+	gizmo.position = Vector2(view_rect.end.x - NavGizmo.SIZE - 4.0, view_rect.position.y + 4.0)
+	proj_list.size = proj_list.content_size()
+	proj_list.position = Vector2(gizmo.position.x + (NavGizmo.SIZE - proj_list.size.x) * 0.5,
+			gizmo.position.y + NavGizmo.SIZE)
 	_place_tool_window()
 	_place_popover()
 
@@ -314,21 +355,69 @@ func _refresh_lists() -> void:
 	for it in elem_list.items:
 		it.disabled = mode == Mode.OBJECT
 	elem_list.set_active(["VERT", "EDGE", "FACE"][elem] if mode == Mode.EDIT else null)
-	pointer_list.set_active(["SELECT", "MOVE", "TOOL"][pointer])
-	pointer_list.items[2].disabled = tool_job.is_empty() and not has_moveable()
-	pointer_list.queue_redraw()
-	for it in tool_menu.items:
-		it.disabled = not tool_available(it.id)
-	tool_menu.queue_redraw()
+	_refresh_toolbar()
 	toggle_list.items[0].lit = snap_on
-	toggle_list.set_active(popover_kind if popover.visible else null)
-	add_list.items[add_list.items.size() - 1].disabled = sel_objects.is_empty() \
-			if mode == Mode.OBJECT else sel_verts.is_empty()
-	add_list.queue_redraw()
+	toggle_list.set_active(popover_kind if popover.visible and popover_kind != "ADD" else null)
+	add_bar.set_active("ADD" if popover.visible and popover_kind == "ADD" else null)
+	proj_list.items[0].lit = orbit.ortho
+	proj_list.set_active(null)
 	mode_list.queue_redraw()
 	elem_list.queue_redraw()
 	toggle_list.queue_redraw()
+	proj_list.queue_redraw()
 	_refresh_snap_menu()
+	_refresh_props()
+
+
+## The tool column: the pointers, then the tools this mode has, then
+## DELETE. Tools that cannot run on what is selected are dimmed.
+func _refresh_toolbar() -> void:
+	var items: Array[Dictionary] = []
+	var can_delete: bool = (not sel_objects.is_empty()) if mode == Mode.OBJECT else (not sel_verts.is_empty())
+	for entry in TOOLBAR[mode]:
+		var id: String = entry[0]
+		var dis := false
+		match id:
+			"SELECT", "MOVE": dis = false
+			"DELETE": dis = not can_delete
+			_: dis = not tool_available(id) and not (tool_live() and tool_kind() == id)
+		items.append({"id": id, "text": id, "icon": entry[1], "disabled": dis})
+	toolbar.set_items(items)
+	var act := "SELECT"
+	if pointer == Pointer.MOVE:
+		act = "MOVE"
+	elif pointer == Pointer.TOOL:
+		act = current_tool
+	toolbar.set_active(act if toolbar.index_of(act) >= 0 else null)
+
+
+## The properties panel: what the active object is and where it sits. A
+## first cut; it will grow.
+func _refresh_props() -> void:
+	var rows: Array[Dictionary] = []
+	var o := active_object
+	if o == null:
+		rows.append({"id": "_none", "text": "NOTHING SELECTED", "inert": true, "disabled": true})
+		props_list.set_items(rows)
+		return
+	rows.append({"id": "_name", "text": o.name, "icon": &"group" if o.is_group else &"mesh", "inert": true})
+	rows.append({"id": "_tl", "text": "LOCATION", "heading": true})
+	var pos := o.position
+	for i in 3:
+		rows.append({"id": "_l%d" % i, "text": "XYZ"[i], "value": "%+.2f" % pos[i], "value_clock": true, "inert": true})
+	rows.append({"id": "_tr", "text": "ROTATION", "heading": true})
+	var rot := o.rotation_degrees
+	for i in 3:
+		rows.append({"id": "_r%d" % i, "text": "XYZ"[i], "value": "%+.1f" % rot[i], "value_clock": true, "inert": true})
+	if o.has_mesh():
+		rows.append({"id": "_tm", "text": "MESH", "heading": true})
+		rows.append({"id": "_mv", "text": "VERTS", "value": "%03d" % o.data.vert_count(), "value_clock": true, "inert": true})
+		rows.append({"id": "_me", "text": "EDGES", "value": "%03d" % o.data.edge_count(), "value_clock": true, "inert": true})
+		rows.append({"id": "_mf", "text": "FACES", "value": "%03d" % o.data.face_count(), "value_clock": true, "inert": true})
+	elif o.is_group:
+		rows.append({"id": "_tg", "text": "GROUP", "heading": true})
+		rows.append({"id": "_gc", "text": "CHILDREN", "value": "%03d" % o.child_objects().size(), "value_clock": true, "inert": true})
+	props_list.set_items(rows)
 
 
 func _walk(n: Node, trail: Array, out: Array[Dictionary]) -> void:
@@ -360,7 +449,9 @@ func _collect(n: Node, out: Array[SceneObject]) -> void:
 
 
 func status_words() -> String:
-	var words: String = "OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem]
+	var view := orbit.view_name()
+	var words: String = (view if view != "" else "USER") + (" ORTHO" if orbit.ortho else " PERSP")
+	words += "    " + ("OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem])
 	if active_object != null:
 		words += "    " + active_object.name
 	if snap_on:
@@ -394,7 +485,7 @@ func open_popover(kind: String) -> void:
 	popover_kind = kind
 	popover.visible = true
 	snap_menu.visible = kind == "SNAP"
-	tool_menu.visible = kind == "TOOL"
+	add_menu.visible = kind == "ADD"
 	matcap_grid.visible = kind == "SHADING"
 	_refresh_snap_menu()
 	matcap_grid.set_active(SceneObject.matcap_index)
@@ -407,7 +498,7 @@ func close_popover() -> void:
 		return
 	popover.visible = false
 	snap_menu.visible = false
-	tool_menu.visible = false
+	add_menu.visible = false
 	matcap_grid.visible = false
 	_refresh_lists()
 
@@ -416,18 +507,18 @@ func _place_popover() -> void:
 	if not popover.visible:
 		return
 	var anchor: Vector2
-	if popover_kind == "TOOL":
-		anchor = pointer_list.position + pointer_list.row_rect(pointer_list.index_of("TOOL")).position
+	if popover_kind == "ADD":
+		anchor = add_bar.position
 	else:
 		var i := toggle_list.index_of(popover_kind)
 		anchor = toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
 	var top := view_rect.position.y - 2.0
-	if popover_kind == "SNAP" or popover_kind == "TOOL":
-		var menu: RowList = snap_menu if popover_kind == "SNAP" else tool_menu
+	if popover_kind == "SNAP" or popover_kind == "ADD":
+		var menu: RowList = snap_menu if popover_kind == "SNAP" else add_menu
 		menu.size = Vector2(POPOVER_W - 8.0, 0.0)
 		var h: float = menu.content_size().y
 		popover.size = Vector2(POPOVER_W, h + 16.0)
-		popover.position = Vector2(minf(anchor.x, view_rect.end.x - POPOVER_W), top)
+		popover.position = Vector2(clampf(anchor.x, view_rect.position.x, view_rect.end.x - POPOVER_W), top)
 		menu.position = popover.position + Vector2(4.0, 8.0)
 		menu.size = Vector2(POPOVER_W - 8.0, h)
 	else:
@@ -498,10 +589,47 @@ func _on_hierarchy_dropped(from_id: Variant, to_id: Variant) -> void:
 
 
 func _on_add_tapped(id: Variant) -> void:
+	close_popover()
+	if id == "GROUP":
+		add_group()
+	else:
+		add_primitive(id)
+
+
+## The tool column. SELECT and MOVE are pointers. A tool makes TOOL the
+## pointer and, if it can run on the selection, starts at once.
+func _on_toolbar_tapped(id: Variant) -> void:
 	match id:
-		"DELETE": delete_selected()
-		"GROUP": add_group()
-		_: add_primitive(id)
+		"SELECT":
+			pointer = Pointer.SELECT
+		"MOVE":
+			pointer = Pointer.MOVE
+		"DELETE":
+			delete_selected()
+		_:
+			pointer = Pointer.TOOL
+			current_tool = id
+			if not (tool_live() and tool_kind() == id):
+				tool_start(id)
+	_refresh_lists()
+
+
+func _on_proj_tapped(_id: Variant) -> void:
+	orbit.set_ortho(not orbit.ortho)
+	_refresh_lists()
+
+
+func _on_gizmo_axis(axis: Vector3) -> void:
+	orbit.view_from_axis(axis)
+	_refresh_lists()
+
+
+## Every orbit goes through here so an axis view's auto-ortho is undone.
+func _orbit(delta: Vector2) -> void:
+	var was := orbit.ortho
+	orbit.orbit(delta)
+	if was != orbit.ortho:
+		_refresh_lists()
 
 
 func _on_mode_tapped(id: Variant) -> void:
@@ -510,21 +638,6 @@ func _on_mode_tapped(id: Variant) -> void:
 
 func _on_elem_tapped(id: Variant) -> void:
 	set_elem({"VERT": Elem.VERT, "EDGE": Elem.EDGE, "FACE": Elem.FACE}[id])
-
-
-func _on_pointer_tapped(id: Variant) -> void:
-	pointer = {"SELECT": Pointer.SELECT, "MOVE": Pointer.MOVE, "TOOL": Pointer.TOOL}[id]
-	if id == "TOOL":
-		open_popover("TOOL")
-	elif popover.visible and popover_kind == "TOOL":
-		close_popover()
-	_refresh_lists()
-
-
-func _on_tool_tapped(id: Variant) -> void:
-	current_tool = id
-	close_popover()
-	tool_start()
 
 
 # --- tools ---------------------------------------------------------------------
@@ -1285,7 +1398,7 @@ func _input(event: InputEvent) -> void:
 			press_pos = click.position
 		if press_pos != null and not popover.get_rect().has_point(press_pos) \
 				and not toggle_list.get_rect().has_point(press_pos) \
-				and not pointer_list.get_rect().has_point(press_pos):
+				and not add_bar.get_rect().has_point(press_pos):
 			close_popover()
 			get_viewport().set_input_as_handled()
 			return
@@ -1382,7 +1495,7 @@ func _touch_drag(d: InputEventScreenDrag) -> void:
 				_finger_tooling = true
 				_tool_drag_update(d.position)
 		else:
-			orbit.orbit(d.position - prev)
+			_orbit(d.position - prev)
 	elif _touches.size() == 2:
 		var keys := _touches.keys()
 		var a: Vector2 = _touches[keys[0]].pos
@@ -1410,6 +1523,8 @@ func _pinch_reset() -> void:
 func _process(delta: float) -> void:
 	for k in _touches:
 		_touches[k].time += delta
+	if tool_live():
+		_refresh_props()
 
 
 func _pen_button(c: InputEventMouseButton) -> void:
@@ -1449,7 +1564,7 @@ func _pen_motion(m: InputEventMouseMotion) -> void:
 	pen_hover_valid = view_rect.has_point(m.position)
 	pen_hover_pos = m.position
 	if _middle_down:
-		orbit.orbit(m.relative)
+		_orbit(m.relative)
 		return
 	if not _pen_down:
 		update_hover(m.position, PEN_RADIUS)

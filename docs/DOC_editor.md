@@ -30,10 +30,23 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 
 ## The screen
 
-Mode bar across the top: OBJECT / EDIT, then VERT / EDGE / FACE, then
-SELECT / MOVE / TOOL, and at the right end the two toggles, SNAP and
-SHADING, which open popovers under the bar. Hierarchy down the right with
-ADD under it. The view is what is left.
+Blender's shape. The header across the top: OBJECT / EDIT, VERT / EDGE /
+FACE, ADD (a menu of the primitives and GROUP), and at the right end SNAP
+and SHADING, which open popovers under it. The tool column down the left,
+icons only, changing with the mode. The hierarchy over the properties down
+the right, each half the height. The view is what is left, with the axes
+ball in its top-right corner and ORTHO under it.
+
+## The view
+
+Perspective by default. ORTHO under the axes ball toggles orthographic.
+The ball shows the three axes as the camera sees them, positive ends
+lettered and filled, negative ends hollow: tap an end to look from there
+(+X is RIGHT, -X LEFT, +Y TOP, -Y BOTTOM, +Z FRONT, -Z BACK), tap the same
+end again to flip to its opposite, drag the ball to orbit. An axis view is
+orthographic by itself and the next orbit brings perspective back, the way
+Blender's auto perspective does. The status line reads the view first:
+FRONT ORTHO, USER PERSP.
 
 ## Pointers
 
@@ -49,15 +62,21 @@ between them (`project.godot` `[input_devices]`).
 | Hover | — | crosshair; the element under it brightens |
 | Middle drag / wheel | — | orbit / zoom, for a desk |
 
-TOOL is live whenever something is selected; see Tools.
+Tools are the column on the left; see Tools.
 
-## Hierarchy
+## Hierarchy and properties
 
 Tap a row to select the object. Press and hold, or drag sideways, to lift a
 row; drop it on another row to parent under it, keeping its place in the
 world; drop it below the rows to send it back to the root. An object cannot
 be dropped on its own descendant. Children hang off a `|_` line under their
 parent, and a parent with more children below carries its line past them.
+When the rows outgrow the panel, a drag up or down them scrolls, as does
+the bar at the right edge or a wheel.
+
+The properties panel under it shows the active object: its name and type,
+location, rotation, and mesh counts or child count. Read-only for now; it
+will grow into Blender's properties editor.
 
 **Groups** are objects with no mesh. ADD > GROUP with objects selected wraps
 them: the group sits at their centre and they become its children. With
@@ -80,13 +99,15 @@ While a move is held to a target, a square mark sits on it in the view.
 
 ## Tools and the tool window
 
-Select something (objects, or vertices, edges or faces), tap TOOL, pick a
-tool. It runs at once at zero and the **tool window** comes up in the
-bottom-left of the view: the tool's name, one row per property with a
-slider to pull and the value as a number, then APPLY and CANCEL. Every tool
-uses the same window; it only differs in which rows it shows. A drag in the
-view while TOOL is the pointer drives the tool too, and starts the current
-one if none is running. With snapping on, lengths go in STEP increments and
+The tool column on the left is SELECT, MOVE, then the tools the mode has,
+then DELETE. In OBJECT mode: ROTATE. In EDIT mode: ROTATE, EXTRUDE,
+EXTRUDE NORMALS, BEVEL and INSET. A tool that cannot run on what is
+selected is dimmed. Select something, tap a tool: it runs at once at zero
+and the **tool window** comes up in the bottom-left of the view: the tool's
+name, one row per property with a slider to pull and the value as a number,
+then APPLY and CANCEL. Every tool uses the same window; it only differs in
+which rows it shows. A drag in the view while a tool is the pointer drives
+it too, and starts it again if none is running. With snapping on, lengths go in STEP increments and
 angles in 5 degree steps. Anything that moves on, such as another
 selection, a mode change or another tool, applies the live one first.
 

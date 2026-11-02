@@ -30,7 +30,11 @@ func _initialize() -> void:
 			"the view sits left of the hierarchy, under the bar (%s)" % ed.view_rect)
 	ok(ed.view_rect.end.y <= 900 and ed.view_rect.position.x >= 12, "and inside the canvas")
 	ok(ed.snap_on and ed.snap_targets.INCREMENT and ed.snap_absolute, "snapping is on by default: increment, absolute grid")
-	for l in [ed.mode_list, ed.elem_list, ed.pointer_list, ed.toggle_list]:
+	ok(ed.view_rect.position.x > ed.toolbar.global_position.x + 40, "the tool column sits left of the view")
+	ok(absf(ed.right_panel.size.y - ed.props_panel.size.y) < 1.0 and ed.props_panel.position.y > ed.right_panel.position.y + ed.right_panel.size.y,
+			"the hierarchy and the properties split the right column")
+	ok(ed.view_rect.encloses(Rect2(ed.gizmo.position, ed.gizmo.size)), "the axes ball is inside the view")
+	for l in [ed.mode_list, ed.elem_list, ed.add_bar, ed.toggle_list]:
 		var centred := true
 		for i in l.items.size():
 			var r: Rect2 = l.row_rect(i)
@@ -46,8 +50,10 @@ func _initialize() -> void:
 	await _fingers()
 	await _rows_by_touch()
 	await _popovers()
+	await _view()
 	await _delete()
 	await _groups()
+	await _scroll()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -173,7 +179,8 @@ func _pen_picks() -> void:
 	_pen_tap(_screen(b.global_position))
 	await _settle()
 	ok(ed.active_object == b, "a pen tap on Cube 001 picks it")
-	var empty := Vector2(ed.view_rect.end.x - 20, ed.view_rect.position.y + 20)
+	# The bottom-right corner: the top-right is the axes ball's.
+	var empty := Vector2(ed.view_rect.end.x - 20, ed.view_rect.end.y - 60)
 	ok(ed.pick_object(empty) == null, "the corner of the view is empty")
 	_pen_tap(empty)
 	await _settle()
@@ -359,20 +366,16 @@ func _tools() -> void:
 	ed.set_elem(ed.Elem.FACE)
 	ed.select_faces({1: true})   # the top
 	await _settle()
-	var p := _row_center(ed.pointer_list, 2)
+	ok(ed.toolbar.index_of("EXTRUDE") >= 0 and ed.toolbar.index_of("EXTRUDE NORMALS") >= 0
+			and ed.toolbar.index_of("ROTATE") >= 0, "in EDIT the tool column has ROTATE, EXTRUDE and EXTRUDE NORMALS")
+	ok(ed.toolbar.items[ed.toolbar.index_of("BEVEL")].disabled, "BEVEL is on it and dimmed")
+	var p := _row_center(ed.toolbar, ed.toolbar.index_of("EXTRUDE"))
 	_finger(0, p, true)
 	_finger(0, p, false)
 	await _settle()
-	ok(ed.pointer == ed.Pointer.TOOL and ed.popover.visible and ed.popover_kind == "TOOL",
-			"TOOL with a face selected opens the tool list")
-	ok(ed.tool_menu.index_of("EXTRUDE") >= 0 and ed.tool_menu.index_of("EXTRUDE NORMALS") >= 0,
-			"EXTRUDE and EXTRUDE NORMALS are on it")
-	ok(ed.tool_menu.items[ed.tool_menu.index_of("BEVEL")].disabled, "BEVEL is listed and disabled")
-	var row: Vector2 = ed.tool_menu.global_position + ed.tool_menu.row_rect(ed.tool_menu.index_of("EXTRUDE")).get_center()
-	_pen_tap(row)
-	await _settle()
-	ok(not ed.tool_job.is_empty() and ed.tool_window.visible and not ed.popover.visible,
-			"EXTRUDE starts: the list closes, the panel comes up")
+	ok(ed.pointer == ed.Pointer.TOOL and ed.current_tool == "EXTRUDE", "a finger tap on EXTRUDE makes it the tool")
+	ok(not ed.tool_job.is_empty() and ed.tool_window.visible, "and it starts: the window comes up")
+	ok(ed.toolbar.active == "EXTRUDE", "the column's cursor box is on it")
 	ok(a.data.face_count() == 10 and a.data.vert_count() == 12, "the top is extruded at zero (%d f, %d v)" % [a.data.face_count(), a.data.vert_count()])
 	ok(ed.sel_faces.size() == 1 and ed.sel_verts.size() == 4, "the new top is the selection")
 	ok(is_zero_approx(ed.tool_value()), "the amount starts at zero")
@@ -620,17 +623,116 @@ func _rows_by_touch() -> void:
 	_finger(0, p, false)
 	await _settle()
 	ok(ed.elem == ed.Elem.FACE, "a finger tap on FACE picks faces")
-	p = _row_center(ed.pointer_list, 2)
+	ok(ed.toolbar.items[ed.toolbar.index_of("EXTRUDE")].disabled, "EXTRUDE is dimmed with nothing selected")
+	p = _row_center(ed.toolbar, ed.toolbar.index_of("EXTRUDE"))
 	_finger(0, p, true)
 	_finger(0, p, false)
 	await _settle()
-	ok(ed.pointer == ed.Pointer.SELECT, "TOOL is disabled with nothing selected")
-	p = _row_center(ed.add_list, 3)
+	ok(ed.pointer == ed.Pointer.SELECT, "and a tap on it does nothing")
+	ok(ed.toolbar.index_of("DELETE") >= 0 and ed.toolbar.items[ed.toolbar.index_of("DELETE")].disabled,
+			"DELETE is on the column, dimmed with nothing selected")
+	p = _row_center(ed.add_bar, 0)
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.popover.visible and ed.popover_kind == "ADD" and ed.add_menu.visible, "ADD opens the add menu")
+	ok(ed.add_menu.index_of("SPHERE") >= 0 and ed.add_menu.index_of("GROUP") >= 0, "with the primitives and GROUP on it")
+	p = ed.add_menu.global_position + ed.add_menu.row_rect(ed.add_menu.index_of("SPHERE")).get_center()
 	_finger(0, p, true)
 	_finger(0, p, false)
 	await _settle()
 	ok(ed.objects().size() == 3 and ed.active_object.name == "Sphere", "the SPHERE row adds a sphere")
-	ok(ed.mode == ed.Mode.OBJECT, "and lands in OBJECT mode")
+	ok(ed.mode == ed.Mode.OBJECT and not ed.popover.visible, "lands in OBJECT mode, and the menu closes")
+
+
+func _view() -> void:
+	ed.orbit.yaw = -0.6
+	ed.orbit.pitch = -0.5
+	ed.orbit.set_ortho(false)
+	ok(ed.status_words().begins_with("USER PERSP"), "a free view reads USER PERSP (%s)" % ed.status_words())
+	var p := _row_center(ed.proj_list, 0)
+	_pen_tap(p)
+	await _settle()
+	ok(ed.orbit.ortho and ed.camera().projection == Camera3D.PROJECTION_ORTHOGONAL, "ORTHO under the ball goes orthographic")
+	ok(ed.proj_list.items[0].lit, "and the row is lit")
+	_pen_tap(p)
+	await _settle()
+	ok(not ed.orbit.ortho and ed.camera().projection == Camera3D.PROJECTION_PERSPECTIVE, "and back")
+	# The axes ball: tap +Z for FRONT, again for BACK, +Y for TOP.
+	var z: Vector2 = ed.gizmo.global_position + ed.gizmo.end_point(Vector3.BACK)[0]
+	_pen_tap(z)
+	await _settle()
+	ok(ed.orbit.view_name() == "FRONT", "a tap on Z looks from the front (%s)" % ed.orbit.view_name())
+	ok(ed.orbit.ortho and ed.orbit.auto_ortho, "and goes orthographic by itself")
+	ok(ed.status_words().begins_with("FRONT ORTHO"), "the status says FRONT ORTHO")
+	z = ed.gizmo.global_position + ed.gizmo.end_point(Vector3.BACK)[0]
+	_pen_tap(z)
+	await _settle()
+	ok(ed.orbit.view_name() == "BACK", "the same end again flips to the back (%s)" % ed.orbit.view_name())
+	var y: Vector2 = ed.gizmo.global_position + ed.gizmo.end_point(Vector3.UP)[0]
+	_pen_tap(y)
+	await _settle()
+	ok(ed.orbit.view_name() == "TOP", "Y looks from the top (%s)" % ed.orbit.view_name())
+	var x: Vector2 = ed.gizmo.global_position + ed.gizmo.end_point(Vector3.LEFT)[0]
+	_pen_tap(x)
+	await _settle()
+	ok(ed.orbit.view_name() == "LEFT", "the hollow X end looks from the left (%s)" % ed.orbit.view_name())
+	# An orbit leaves the axis view and its auto-ortho with it.
+	var empty := Vector2(ed.view_rect.get_center().x, ed.view_rect.end.y - 60)
+	_finger(0, empty, true)
+	_finger_move(0, empty, empty + Vector2(-80, 0))
+	_finger(0, empty + Vector2(-80, 0), false)
+	ok(ed.orbit.view_name() == "" and not ed.orbit.ortho, "a finger orbit leaves the axis view and perspective returns")
+	# A drag on the ball orbits too.
+	var yaw0: float = ed.orbit.yaw
+	var c: Vector2 = ed.gizmo.global_position + ed.gizmo.size * 0.5
+	_pen_drag(c, c + Vector2(40, 0))
+	ok(ed.orbit.yaw != yaw0, "a drag on the ball orbits")
+	ed.orbit.yaw = -0.6
+	ed.orbit.pitch = -0.5
+	ed.orbit.distance = 8.0
+	ed.orbit.target = Vector3.ZERO
+	ed.orbit.apply()
+	# The properties panel shows the active object.
+	var a: Node3D = ed.objects()[0]
+	ed.select_object(a)
+	a.global_position = Vector3(1.25, 0, -3)
+	ed._refresh_props()
+	var texts := []
+	for it in ed.props_list.items:
+		texts.append(it.text + ":" + str(it.get("value", "")))
+	ok(ed.props_list.items[0].text == a.name, "properties lead with the object's name")
+	ok(texts.has("X:+1.25") and texts.has("Z:-3.00"), "and show its location (%s)" % str(texts))
+	ok(texts.has("VERTS:%03d" % a.data.vert_count()), "and its vertex count")
+	ed.clear_object_selection()
+	ok(ed.props_list.items[0].text == "NOTHING SELECTED", "with nothing selected they say so")
+
+
+func _scroll() -> void:
+	var extra := []
+	for i in 14:
+		extra.append(ed.add_primitive("CUBE"))
+	await _settle()
+	ok(ed.hierarchy.scrollable() and ed.hierarchy.max_scroll() > 0.0, "many objects make the hierarchy scroll")
+	var top_before: Variant = ed.hierarchy.items[ed.hierarchy.row_at(Vector2(20, 10))].id
+	var from: Vector2 = ed.hierarchy.global_position + Vector2(60, ed.hierarchy.size.y - 30)
+	_pen_drag(from, from + Vector2(0, -160))
+	await _settle()
+	ok(ed.hierarchy.scroll > 0.0, "a drag up the rows scrolls them (%.0f)" % ed.hierarchy.scroll)
+	var top_after: Variant = ed.hierarchy.items[ed.hierarchy.row_at(Vector2(20, 10))].id
+	ok(top_after != top_before, "a different row is at the top now")
+	ok(ed.active_object == extra[extra.size() - 1], "and the drag did not select anything")
+	var row: Vector2 = ed.hierarchy.global_position + Vector2(60, 10)
+	_pen_tap(row)
+	await _settle()
+	ok(ed.active_object != null and ed.active_object.get_instance_id() == top_after, "a tap picks the row that is really there")
+	var thumb: Rect2 = ed.hierarchy.thumb_rect()
+	ok(thumb.size.y < ed.hierarchy.size.y and thumb.position.y > 0.0, "the scrollbar's thumb is part way down")
+	for c in extra:
+		ed.select_object(c)
+		ed.delete_selected()
+	await _settle()
+	ok(not ed.hierarchy.scrollable(), "with them gone it no longer scrolls")
 
 
 func _delete() -> void:

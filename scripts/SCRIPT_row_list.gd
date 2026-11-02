@@ -11,7 +11,11 @@ extends Control
 ##   parent), disabled, heading (a section label, not a row), value (text at
 ##   the right), value_clock (the value is a number: clock face), on (true /
 ##   false draws a lit / unlit mark at the right), lit (a bar toggle that is
-##   on).
+##   on), inert (shown, never pressed: a readout row).
+##
+## A list taller than its box scrolls: a drag up or down the rows, the bar
+## at its right edge, or the wheel. A sideways drag (or a hold) still lifts
+## a row when the list is draggable.
 
 const T := preload("res://scripts/SCRIPT_ui_tokens.gd")
 const Chamfer := preload("res://scripts/SCRIPT_chamfer_panel.gd")
@@ -21,23 +25,30 @@ signal drag_dropped(from_id: Variant, to_id: Variant)   # to_id null: dropped on
 
 @export var horizontal := false
 @export var draggable := false
+@export var icon_only := false      # a toolbar: the glyph centred, no text
+@export var row_h: float = T.ROW_H
 @export var font_size: int = T.FS_BODY
 @export var indent := 16.0
 
 var items: Array[Dictionary] = []
 var active: Variant = null          # id under the cursor box
 var selected: Dictionary = {}       # id -> true, brightened rows
+var scroll := 0.0                   # pixels the rows have moved up
 
 const HOLD := 0.3
 const SLOP := 14.0
 const REACH := 5.0
 const MARK := 8.0
+const BAR_W := 10.0
 
 var _press_id: Variant = null
 var _press_pos := Vector2.ZERO
 var _press_time := 0.0
 var _press_pointer := -1            # touch index, or -1 for the pen/mouse
 var _dragging := false
+var _scrolling := false
+var _barring := false
+var _scroll_from := 0.0
 var _drag_pos := Vector2.ZERO
 var _box_rect := Rect2()
 var _box_live := false
@@ -45,6 +56,7 @@ var _box_live := false
 
 func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
+	clip_contents = true
 	set_process(true)
 
 
@@ -66,27 +78,32 @@ func set_selected(ids: Dictionary) -> void:
 # --- geometry -----------------------------------------------------------------
 
 func row_height(i: int) -> float:
-	return float(T.HEAD_H) if items[i].get("heading", false) else float(T.ROW_H)
+	return float(T.HEAD_H) if items[i].get("heading", false) else row_h
 
 
+## In list coordinates, with the scroll taken off.
 func row_rect(i: int) -> Rect2:
 	if horizontal:
 		var x := 0.0
 		for k in i:
 			x += row_width(k)
-		return Rect2(x, 0.0, row_width(i), T.ROW_H)
+		return Rect2(x, 0.0, row_width(i), row_h)
 	var y := 0.0
 	for k in i:
 		y += row_height(k)
-	return Rect2(0.0, y, size.x, row_height(i))
+	return Rect2(0.0, y - scroll, size.x - (BAR_W if scrollable() else 0.0), row_height(i))
 
 
 ## Across: the content, centred, with PAD either side.
 func row_width(i: int) -> float:
+	if icon_only:
+		return row_h
 	return _content_width(items[i]) + T.PAD * 2
 
 
 func _content_width(it: Dictionary) -> float:
+	if icon_only:
+		return T.ICON
 	var f: Font = Fonts.ui()
 	var w: float = f.get_string_size(it.text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x
 	if it.has("icon"):
@@ -94,12 +111,42 @@ func _content_width(it: Dictionary) -> float:
 	return w
 
 
-## The whole list's natural size.
+## The whole list's natural size, scroll aside.
 func content_size() -> Vector2:
 	if items.is_empty():
 		return Vector2.ZERO
-	var last := row_rect(items.size() - 1)
-	return Vector2(last.end.x, T.ROW_H) if horizontal else Vector2(size.x, last.end.y)
+	if horizontal:
+		var w := 0.0
+		for i in items.size():
+			w += row_width(i)
+		return Vector2(w, row_h)
+	var h := 0.0
+	for i in items.size():
+		h += row_height(i)
+	return Vector2(size.x, h)
+
+
+func scrollable() -> bool:
+	return not horizontal and content_size().y > size.y + 0.5
+
+
+func max_scroll() -> float:
+	return maxf(0.0, content_size().y - size.y)
+
+
+func set_scroll(v: float) -> void:
+	scroll = clampf(v, 0.0, max_scroll())
+	queue_redraw()
+
+
+func bar_rect() -> Rect2:
+	return Rect2(size.x - BAR_W, 0.0, BAR_W, size.y)
+
+
+func thumb_rect() -> Rect2:
+	var h := maxf(24.0, size.y * size.y / content_size().y)
+	var y := (size.y - h) * (scroll / max_scroll()) if max_scroll() > 0.0 else 0.0
+	return Rect2(size.x - BAR_W + 2.0, y, BAR_W - 4.0, h)
 
 
 ## The row at `pos` (local), or the nearest within REACH; -1 for none.
@@ -107,7 +154,7 @@ func row_at(pos: Vector2) -> int:
 	var best := -1
 	var best_d := INF
 	for i in items.size():
-		if items[i].get("heading", false):
+		if items[i].get("heading", false) or items[i].get("inert", false):
 			continue
 		var r := row_rect(i)
 		var d := maxf(maxf(r.position.x - pos.x, pos.x - r.end.x),
@@ -145,52 +192,85 @@ func _gui_input(event: InputEvent) -> void:
 	elif click != null and click.button_index == MOUSE_BUTTON_LEFT:
 		if click.pressed:
 			_press(click.position, -1)
-		elif _press_pointer == -1 and _press_id != null:
+		elif _press_pointer == -1 and (_press_id != null or _scrolling or _barring):
 			_release(click.position)
 		accept_event()
-	elif motion != null and _press_pointer == -1 and _press_id != null:
+	elif click != null and scrollable() and click.pressed \
+			and click.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
+		set_scroll(scroll + (row_h if click.button_index == MOUSE_BUTTON_WHEEL_DOWN else -row_h))
+		accept_event()
+	elif motion != null and _press_pointer == -1 and (_press_id != null or _scrolling or _barring):
 		_move(motion.position)
 		accept_event()
 
 
 func _press(pos: Vector2, pointer: int) -> void:
-	if _press_id != null:
+	if _press_id != null or _scrolling or _barring:
 		return
-	var i := row_at(pos)
-	if i < 0 or items[i].get("disabled", false):
-		return
-	_press_id = items[i].id
 	_press_pos = pos
 	_press_time = 0.0
 	_press_pointer = pointer
 	_dragging = false
 	_drag_pos = pos
+	_scroll_from = scroll
+	if scrollable() and bar_rect().has_point(pos):
+		_barring = true
+		_bar_to(pos.y)
+		return
+	var i := row_at(pos)
+	if i < 0 or items[i].get("disabled", false):
+		# Pressed between rows: a drag from here can still scroll.
+		_scrolling = scrollable()
+		return
+	_press_id = items[i].id
 
 
 func _move(pos: Vector2) -> void:
 	_drag_pos = pos
-	if draggable and not _dragging and pos.distance_to(_press_pos) > SLOP:
-		_dragging = true
+	if _barring:
+		_bar_to(pos.y)
+		return
+	if _scrolling:
+		set_scroll(_scroll_from - (pos.y - _press_pos.y))
+		return
+	if not _dragging and pos.distance_to(_press_pos) > SLOP:
+		var d := pos - _press_pos
+		if draggable and absf(d.x) > absf(d.y):
+			_dragging = true
+		elif scrollable():
+			# A drag up or down the list scrolls it; the press is not a tap.
+			_press_id = null
+			_scrolling = true
+			set_scroll(_scroll_from - d.y)
 	queue_redraw()
+
+
+func _bar_to(y: float) -> void:
+	var h := thumb_rect().size.y
+	var t := clampf((y - h * 0.5) / maxf(size.y - h, 1.0), 0.0, 1.0)
+	set_scroll(t * max_scroll())
 
 
 func _release(pos: Vector2) -> void:
 	var id: Variant = _press_id
 	_press_id = null
 	_press_pointer = -1
-	if _dragging:
+	if _scrolling or _barring:
+		_scrolling = false
+		_barring = false
+	elif _dragging:
 		_dragging = false
 		var i := row_at(pos)
 		var to: Variant = items[i].id if i >= 0 else null
 		if to != id:
 			drag_dropped.emit(id, to)
-	else:
+	elif id != null:
 		tapped.emit(id)
 	queue_redraw()
 
 
 func _process(delta: float) -> void:
-	if _press_id != null and draggable and not _dragging:
+	if _press_id != null and draggable and not _dragging and not _scrolling:
 		_press_time += delta
 		if _press_time >= HOLD:
 			_dragging = true
@@ -223,6 +303,8 @@ func _draw() -> void:
 	for i in items.size():
 		var it := items[i]
 		var r := row_rect(i)
+		if r.end.y < 0.0 or r.position.y > size.y:
+			continue
 		if it.get("heading", false):
 			var hy := r.position.y + _baseline(font, T.FS_LABEL, r.size.y)
 			draw_string(font, Vector2(T.PAD, hy), it.text, HORIZONTAL_ALIGNMENT_LEFT, -1, T.FS_LABEL, T.COL_TAG)
@@ -241,14 +323,18 @@ func _draw() -> void:
 			col = T.COL_WAIT
 		var depth := int(it.get("depth", 0))
 		var x := r.position.x + T.PAD + depth * indent
-		if horizontal:
+		if horizontal or icon_only:
 			x = r.position.x + (r.size.x - _content_width(it)) * 0.5
 		if depth > 0:
 			_draw_tree(it, r, depth)
 		if it.has("icon"):
 			var ir := Rect2(x, r.position.y + (r.size.y - T.ICON) * 0.5, T.ICON, T.ICON)
+			if icon_only:
+				ir = ir.grow(2.0)
 			Icons.draw(self, it.icon, ir, col)
 			x += T.ICON + T.ICON_GAP
+		if icon_only:
+			continue
 		var y := r.position.y + _baseline(f, font_size, r.size.y)
 		draw_string(f, Vector2(x, y), it.text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, col)
 		if disabled:
@@ -271,6 +357,10 @@ func _draw() -> void:
 				draw_rect(m, T.COL_DIM if disabled else T.COL_NAME, true)
 			else:
 				draw_rect(m, T.COL_DIM, false, 1.0)
+	if scrollable():
+		var br := bar_rect()
+		draw_line(Vector2(br.get_center().x, 0.0), Vector2(br.get_center().x, size.y), T.COL_DIM, 1.0)
+		draw_rect(thumb_rect(), T.COL_NAME if _barring else T.COL_WAIT, true)
 	if _dragging:
 		# The drop target gets a WAIT box; the lifted row rides the pointer.
 		var over := row_at(_drag_pos)
