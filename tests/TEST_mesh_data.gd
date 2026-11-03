@@ -27,6 +27,7 @@ func _initialize() -> void:
 	_dict()
 	_modifiers()
 	_merge_fill_linked()
+	_trim()
 	print("mesh data: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -401,3 +402,109 @@ func _merge_fill_linked() -> void:
 	m = MeshData.make_cube()
 	m.duplicate_selection({0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true})
 	ok(m.linked({0: true}).size() == 8, "linked from one vertex finds its own cube, not the copy")
+
+
+func _box(x0: float, y0: float, x1: float, y1: float) -> PackedVector2Array:
+	return PackedVector2Array([Vector2(x0, y0), Vector2(x1, y0), Vector2(x1, y1), Vector2(x0, y1)])
+
+
+func _genus_check(m: MeshData, chi: int, label: String) -> void:
+	var efm := m.edge_face_map()
+	var open := 0
+	for e in efm:
+		if efm[e].size() != 2:
+			open += 1
+	ok(open == 0, "%s: every edge has two faces (%d do not)" % [label, open])
+	var c := m.vert_count() - m.edge_count() + m.face_count()
+	ok(c == chi, "%s: V-E+F = %d (%d: %d v %d e %d f)" % [label, chi, c, m.vert_count(), m.edge_count(), m.face_count()])
+
+
+func _trim() -> void:
+	# Looking from the front: right is +X, up +Y, the camera looks down -Z.
+	var R := Vector3.RIGHT
+	var U := Vector3.UP
+	var F := Vector3.FORWARD
+	var xf := Transform3D()
+	# Cut the right part off a cube, top to bottom: a box past the silhouette.
+	var m := MeshData.make_cube()
+	var r := m.trim(xf, R, U, F, _box(0.5, -2, 2, 2))
+	ok(r.changed and r.capped == 1 and r.open == 0, "a slice off the side is cut and filled (%s)" % str(r))
+	_genus_check(m, 2, "sliced cube")
+	_outward_all(m, Vector3(-0.25, 0, 0), "sliced cube")
+	var hi := -INF
+	for v in m.verts:
+		hi = maxf(hi, v.x)
+	ok(is_equal_approx(hi, 0.5), "nothing is left past the cut (x up to %.3f)" % hi)
+	ok(m.vert_count() == 8, "the cut adds just its four corners (%d v)" % m.vert_count())
+	# A tunnel through the middle: the shape inside the silhouette.
+	m = MeshData.make_cube()
+	r = m.trim(xf, R, U, F, _box(-0.4, -0.4, 0.4, 0.4))
+	ok(r.changed and r.capped == 1 and r.open == 0, "a square hole through is cut and walled (%s)" % str(r))
+	_genus_check(m, 0, "tunnelled cube")
+	var inward := 0
+	var walls := 0
+	for f in m.face_count():
+		var c := m.face_center(f)
+		if absf(c.z) < 0.99 and (absf(absf(c.x) - 0.4) < 0.01 or absf(absf(c.y) - 0.4) < 0.01):
+			walls += 1
+			if m.face_normal(f).dot(Vector3(c.x, c.y, 0)) < 0.0:
+				inward += 1
+	ok(walls >= 4 and inward == walls, "the tunnel's walls face into it, away from the material (%d of %d)" % [inward, walls])
+	# Keep inside: only the slab within the shape stays.
+	m = MeshData.make_cube()
+	r = m.trim(xf, R, U, F, _box(0.5, -2, 2, 2), true)
+	_genus_check(m, 2, "kept slab")
+	var lo := INF
+	for v in m.verts:
+		lo = minf(lo, v.x)
+	ok(is_equal_approx(lo, 0.5), "keeping inside leaves x from 0.5 (%.3f)" % lo)
+	# A lasso-ish triangle across a sphere's top corner.
+	m = MeshData.make_sphere()
+	r = m.trim(xf, R, U, F, PackedVector2Array([Vector2(0.2, 0.5), Vector2(2, 0.5), Vector2(2, 2.5), Vector2(-0.4, 2.5)]))
+	ok(r.changed and r.open == 0, "a sphere's top corner trimmed by a slanted shape, filled (%s)" % str(r))
+	_genus_check(m, 2, "trimmed sphere")
+	# From an angle (the camera turned): still closed.
+	m = MeshData.make_cube()
+	var b := Basis.from_euler(Vector3(-0.5, 0.7, 0))
+	r = m.trim(xf, b.x, b.y, -b.z, _box(-0.3, -2, 3, 0.3))
+	ok(r.changed and r.open == 0, "a cut from a turned view is filled (%s)" % str(r))
+	_genus_check(m, 2, "cube cut at an angle")
+	# A moved and scaled object: the cut is where it is on screen.
+	m = MeshData.make_cube()
+	var moved := Transform3D(Basis.from_scale(Vector3(2, 1, 1)), Vector3(10, 0, 0))
+	m.trim(moved, R, U, F, _box(11, -2, 14, 2))
+	hi = -INF
+	for v in m.verts:
+		hi = maxf(hi, (moved * v).x)
+	ok(is_equal_approx(hi, 11.0), "on a moved, scaled object the cut lands at world x 11 (%.3f)" % hi)
+	_genus_check(m, 2, "moved cube")
+	# An open mesh: a plane from above gets a hole, left open as a plane should be.
+	m = MeshData.make_plane(4.0)
+	r = m.trim(xf, Vector3.RIGHT, Vector3.FORWARD, Vector3.DOWN, _box(-0.5, -0.5, 0.5, 0.5))
+	ok(r.changed and r.capped == 0, "a hole in a plane is not filled (%s)" % str(r))
+	var area := 0.0
+	for f in m.face_count():
+		var tri := m.face_triangles(f)
+		for t in tri:
+			area += (m.verts[t[1]] - m.verts[t[0]]).cross(m.verts[t[2]] - m.verts[t[0]]).length() * 0.5
+	ok(is_equal_approx(area, 15.0), "the plane keeps 16 less the hole's 1 (%.3f)" % area)
+	# A round lasso through a sphere: a tunnel with a 24-sided wall.
+	m = MeshData.make_sphere()
+	var ring := PackedVector2Array()
+	for k in 24:
+		ring.append(Vector2(cos(TAU * k / 24.0), sin(TAU * k / 24.0)) * 0.35)
+	r = m.trim(xf, R, U, F, ring)
+	ok(r.changed and r.open == 0, "a round lasso tunnels through a sphere (%s)" % str(r))
+	_genus_check(m, 0, "tunnelled sphere")
+	# A star, dents and all, across a cube's corner.
+	m = MeshData.make_cube()
+	var star := PackedVector2Array()
+	for k in 10:
+		var rad := 1.2 if k % 2 == 0 else 0.5
+		star.append(Vector2(1.0, 1.0) + Vector2(cos(TAU * k / 10.0), sin(TAU * k / 10.0)) * rad)
+	r = m.trim(xf, R, U, F, star)
+	ok(r.changed and r.open == 0, "a star across a corner (%s)" % str(r))
+	_genus_check(m, 2, "star-trimmed cube")
+	# A shape that misses changes nothing.
+	m = MeshData.make_cube()
+	ok(not m.trim(xf, R, U, F, _box(5, 5, 6, 6)).changed and m.face_count() == 6, "a shape off the mesh changes nothing")

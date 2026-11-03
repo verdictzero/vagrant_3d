@@ -34,6 +34,7 @@ func _draw() -> void:
 	else:
 		_draw_edit_mode(cam)
 	editor.gizmo_draw(self)
+	_draw_trim()
 	if editor.box_active:
 		var r: Rect2 = editor.box_rect()
 		draw_rect(r, T.SEL_BG, true)
@@ -52,6 +53,22 @@ func _draw() -> void:
 		draw_line(p + Vector2(0, 3), p + Vector2(0, 10), T.COL_NAME, 1.0)
 	_draw_status()
 	_draw_flash()
+
+
+## The trim shape being drawn: a closed outline, keylined, with a faint fill
+## for a box (a lasso may cross itself, which a fill cannot take).
+func _draw_trim() -> void:
+	if not editor.trim_drawing:
+		return
+	var pts: PackedVector2Array = editor.trim_outline()
+	if pts.size() < 2:
+		return
+	if editor.trim_shape == "BOX" and pts.size() == 4:
+		draw_colored_polygon(pts, T.SEL_BG)
+	var ring := pts.duplicate()
+	ring.append(pts[0])
+	draw_polyline(ring, T.KEYLINE, 4.0, true)
+	draw_polyline(ring, T.COL_CURSOR, 2.0, true)
 
 
 ## A message over the top of the view that fades out over its last second.

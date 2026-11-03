@@ -2,7 +2,8 @@
 
 Objects and groups in a hierarchy, four primitives, OBJECT and EDIT mode
 with VERT / EDGE / FACE, move, rotate, scale, extrude, inset, bevel, loop
-cut, duplicate, merge and fill, modifiers (subdivision, mirror, array),
+cut, trim (Nomad Sculpt's, orthographic), duplicate, merge and fill,
+modifiers (subdivision, mirror, array),
 smooth shading, transform gizmos, undo and redo, saving and OBJ export,
 snapping, matcaps. Android first,
 S Pen aware, laid out for a tablet or a foldable. The UI speaks the house
@@ -134,8 +135,8 @@ While a move is held to a target, a square mark sits on it in the view.
 
 The tool column on the left is SELECT, MOVE, then the tools the mode has,
 then the one-tap actions: DUPLICATE, in EDIT also MERGE and FILL, and
-DELETE. In OBJECT mode the tools are ROTATE and SCALE; in EDIT mode ROTATE,
-SCALE, EXTRUDE, EXTRUDE NORMALS, INSET, BEVEL and LOOP CUT. A tool or action
+DELETE. In OBJECT mode the tools are ROTATE, SCALE and TRIM; in EDIT mode
+ROTATE, SCALE, EXTRUDE, EXTRUDE NORMALS, INSET, BEVEL, LOOP CUT and TRIM. A tool or action
 that cannot run on what is selected is dimmed. Select something, tap a tool: it runs at once at zero
 and the **tool window** comes up in the bottom-left of the view: the tool's
 name, one row per property with a slider to pull and the value as a number,
@@ -169,6 +170,27 @@ their centre. A new face turns the way the faces beside it do.
 DUPLICATE copies the selection in place (objects with their children, or
 in EDIT the selected faces, edges and vertices) and leaves MOVE as the
 pointer, so the next drag moves the copy.
+
+## Trim
+
+Nomad Sculpt's trim, orthographic only. Pick TRIM and the view turns
+orthographic if it was not (the flash line says so); a bar at the top of
+the view picks LASSO or BOX, and CUT INSIDE or KEEP INSIDE. Draw with one
+finger or the pen and lift: everything inside the shape, straight through
+the mesh along the view, is cut away from the selected objects (the active
+one in EDIT), or with KEEP INSIDE everything outside. The cut is filled, so
+a closed mesh stays closed: a notch off a side gets a flat wall, a shape
+inside the outline bores a tunnel through with walls all round. An open
+mesh (a plane) gets a hole and stays open. A second finger cancels the
+drawing; a trim drawn in perspective is refused. One undo step per trim.
+
+How: each face is clipped against the shape in view space, faces seen
+edge-on are cut by the shape's walls where they cross them, and cut points
+are welded so neighbours stay joined. The open loops left on the shape's
+walls are unrolled (how far round the shape, how deep), cut at every corner
+of the shape so each piece lies flat on one wall, triangulated, and lifted
+back (`MeshData.trim`). Faces that are not convex, which trim makes, are
+ear-clipped wherever triangles are needed.
 
 ## Gizmos
 

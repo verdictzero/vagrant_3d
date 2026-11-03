@@ -64,6 +64,7 @@ func _initialize() -> void:
 	await _modifiers()
 	await _names()
 	await _merge_fill()
+	await _trims()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -1412,3 +1413,98 @@ func _merge_fill() -> void:
 	ok(ed.sel_verts.size() == 8 and ed.sel_verts.keys().all(func(v): return copies.has(v)),
 			"L from a copy takes the copy only")
 	ed.set_mode(ed.Mode.OBJECT)
+
+
+func _closed_chi(m: MeshData) -> int:
+	var efm := m.edge_face_map()
+	for e in efm:
+		if efm[e].size() != 2:
+			return 99
+	return m.vert_count() - m.edge_count() + m.face_count()
+
+
+func _trims() -> void:
+	ed.file_new()
+	var c: Node3D = ed.add_primitive("CUBE")
+	ed.orbit.target = Vector3.ZERO
+	ed.orbit.distance = 8.0
+	ed.orbit.set_view("FRONT", false)
+	ed.orbit.set_ortho(false)
+	await _settle()
+	ok(ed.toolbar.index_of("TRIM") >= 0 and not ed.toolbar.items[ed.toolbar.index_of("TRIM")].disabled,
+			"TRIM is on the column, live with a mesh selected")
+	var p := _row_center(ed.toolbar, ed.toolbar.index_of("TRIM"))
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(ed.trim_active() and ed.orbit.ortho, "picking TRIM turns the view orthographic")
+	ok(ed.flash_text == "ORTHO ON FOR TRIM", "and says so")
+	ok(ed.trim_shape_bar.visible and ed.trim_mode_bar.visible, "its bar is up: LASSO / BOX, CUT / KEEP")
+	ok(ed.status_words().contains("TRIM LASSO CUT INSIDE"), "the status names it")
+	# A box over the right part of the cube, top to bottom past the edges.
+	_pen_tap(ed.trim_shape_bar.global_position + ed.trim_shape_bar.row_rect(1).get_center())
+	ok(ed.trim_shape == "BOX", "BOX picked")
+	var a := _screen(Vector3(0.5, 2.0, 0))
+	var b := _screen(Vector3(2.5, -2.0, 0))
+	_pen_drag(a, b)
+	await _settle()
+	var hi := -INF
+	for v in c.data.verts:
+		hi = maxf(hi, v.x)
+	ok(absf(hi - 0.5) < 0.02, "the box cuts the cube off at x 0.5 (%.3f)" % hi)
+	ok(_closed_chi(c.data) == 2, "and leaves it closed")
+	ok(ed.history_label() == "TRIM" and ed.flash_text == "TRIMMED", "one undo step, and a flash")
+	ed.undo()
+	c = ed.active_object
+	ok(c.data.face_count() == 6, "undo puts the cube back")
+	# A lasso drawn with a finger: a circle in the middle tunnels through.
+	_pen_tap(ed.trim_shape_bar.global_position + ed.trim_shape_bar.row_rect(0).get_center())
+	var centre := _screen(Vector3.ZERO)
+	var rad := (_screen(Vector3(0.4, 0, 0)) - centre).x
+	var prev := centre + Vector2(rad, 0)
+	_finger(0, prev, true)
+	for k in range(1, 33):
+		var q := centre + Vector2(cos(TAU * k / 32.0), sin(TAU * k / 32.0)) * rad
+		_finger_move(0, prev, q)
+		prev = q
+	_finger(0, prev, false)
+	await _settle()
+	ok(_closed_chi(c.data) == 0, "a finger's lasso through the middle makes a tunnel (chi %d)" % _closed_chi(c.data))
+	ed.undo()
+	c = ed.active_object
+	# KEEP INSIDE.
+	_pen_tap(ed.trim_mode_bar.global_position + ed.trim_mode_bar.row_rect(1).get_center())
+	ok(ed.trim_keep, "KEEP INSIDE picked")
+	ed.trim_shape = "BOX"
+	_pen_drag(a, b)
+	await _settle()
+	var lo := INF
+	for v in c.data.verts:
+		lo = minf(lo, v.x)
+	ok(absf(lo - 0.5) < 0.02 and _closed_chi(c.data) == 2, "keeping inside leaves the slab from x 0.5 (%.3f)" % lo)
+	ed.undo()
+	c = ed.active_object
+	ed.trim_keep = false
+	# In perspective it is refused.
+	ed.orbit.set_ortho(false)
+	_pen_drag(a, b)
+	await _settle()
+	ok(c.data.face_count() == 6 and ed.flash_text.contains("ORTHO"), "a trim in perspective is refused (%s)" % ed.flash_text)
+	# A box that misses does nothing.
+	ed.orbit.set_ortho(true)
+	var h: int = ed.history_index
+	_pen_drag(_screen(Vector3(3, 3, 0)), _screen(Vector3(3.6, 3.6, 0)))
+	await _settle()
+	ok(ed.history_index == h and c.data.face_count() == 6, "a box beside the cube changes nothing")
+	# Two fingers while drawing cancel it.
+	ed.trim_shape = "BOX"
+	_finger(0, a, true)
+	_finger_move(0, a, a + Vector2(80, 0))
+	_finger(1, b, true)
+	ok(not ed.trim_drawing, "a second finger cancels the drawing")
+	_finger(1, b, false)
+	_finger(0, a + Vector2(80, 0), false)
+	ok(c.data.face_count() == 6, "and nothing is cut")
+	ed.pointer = ed.Pointer.SELECT
+	ed._refresh_lists()
+	ok(not ed.trim_shape_bar.visible, "with another tool the trim bar goes")

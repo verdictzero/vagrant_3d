@@ -43,10 +43,10 @@ const MESH_TOOLS := ["EXTRUDE", "EXTRUDE NORMALS", "INSET", "BEVEL", "LOOP CUT"]
 ## pointers; the rest are tools.
 const TOOLBAR := {
 	Mode.OBJECT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
-		["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
+		["TRIM", &"trim"], ["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
 	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
 		["EXTRUDE", &"extrude"], ["EXTRUDE NORMALS", &"extrude_normals"], ["INSET", &"inset"],
-		["BEVEL", &"bevel"], ["LOOP CUT", &"loopcut"], ["DUPLICATE", &"duplicate"], ["MERGE", &"merge"],
+		["BEVEL", &"bevel"], ["LOOP CUT", &"loopcut"], ["TRIM", &"trim"], ["DUPLICATE", &"duplicate"], ["MERGE", &"merge"],
 		["FILL", &"fill"], ["DELETE", &"delete"]],
 }
 const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
@@ -153,6 +153,15 @@ var select_menu: RowList
 var modifier_menu: RowList
 var prompt: TextPrompt
 var _prompt_for := ""
+
+# Trim, Nomad Sculpt's way, orthographic only: a lasso or a box drawn on the
+# view, cut straight through along it. The shape so far, in screen pixels.
+var trim_shape := "LASSO"
+var trim_keep := false
+var trim_points := PackedVector2Array()
+var trim_drawing := false
+var trim_shape_bar: RowList
+var trim_mode_bar: RowList
 var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
@@ -339,6 +348,10 @@ func _build_ui() -> void:
 	ui.add_child(modifier_menu)
 	props_list.tapped.connect(_on_prop_tapped)
 	hierarchy.double_tapped.connect(_on_hierarchy_double_tapped)
+	trim_shape_bar = _bar([{"id": "LASSO", "text": "LASSO", "icon": &"lasso"},
+			{"id": "BOX", "text": "BOX", "icon": &"box"}], _on_trim_bar_tapped)
+	trim_mode_bar = _bar([{"id": "CUT", "text": "CUT INSIDE"}, {"id": "KEEP", "text": "KEEP INSIDE"}],
+			_on_trim_bar_tapped)
 	prompt = Prompt.new()
 	prompt.submitted.connect(_on_prompt_submitted)
 	prompt.cancelled.connect(func() -> void: _prompt_for = "")
@@ -423,6 +436,11 @@ func _layout() -> void:
 	_place_popover()
 	if prompt != null:
 		prompt.position = Vector2(view_rect.get_center().x - TextPrompt.W * 0.5, view_rect.position.y + 60.0)
+	if trim_shape_bar != null:
+		trim_shape_bar.size = trim_shape_bar.content_size()
+		trim_shape_bar.position = view_rect.position + Vector2(8.0, 8.0)
+		trim_mode_bar.size = trim_mode_bar.content_size()
+		trim_mode_bar.position = trim_shape_bar.position + Vector2(trim_shape_bar.size.x + T.GUTTER * 2.0, 0.0)
 
 
 func _refresh_lists() -> void:
@@ -461,6 +479,12 @@ func _refresh_lists() -> void:
 	_refresh_props()
 	if select_menu != null:
 		select_menu.items[3].disabled = mode != Mode.EDIT or sel_verts.is_empty()
+	if trim_shape_bar != null:
+		var trimming := trim_active()
+		trim_shape_bar.visible = trimming
+		trim_mode_bar.visible = trimming
+		trim_shape_bar.set_active(trim_shape)
+		trim_mode_bar.set_active("KEEP" if trim_keep else "CUT")
 
 
 ## The tool column: the pointers, then the tools this mode has, then
@@ -475,6 +499,7 @@ func _refresh_toolbar() -> void:
 			"SELECT", "MOVE": dis = false
 			"DELETE", "DUPLICATE": dis = not can_delete
 			"MERGE", "FILL": dis = mode != Mode.EDIT or sel_verts.size() < 2
+			"TRIM": dis = _trim_targets().is_empty()
 			_: dis = not tool_available(id) and not (tool_live() and tool_kind() == id)
 		items.append({"id": id, "text": id, "icon": entry[1], "disabled": dis})
 	toolbar.set_items(items)
@@ -754,6 +779,8 @@ func status_words() -> String:
 	words += "    " + ("OBJECT" if mode == Mode.OBJECT else "EDIT  " + ["VERT", "EDGE", "FACE"][elem])
 	if active_object != null:
 		words += "    " + active_object.name
+	if trim_active():
+		words += "    TRIM " + trim_shape + (" KEEP INSIDE" if trim_keep else " CUT INSIDE")
 	if snap_on:
 		var on: Array = []
 		for k in snap_targets:
@@ -936,6 +963,13 @@ func _on_toolbar_tapped(id: Variant) -> void:
 			merge_selected()
 		"FILL":
 			fill_selected()
+		"TRIM":
+			_tool_finish()
+			pointer = Pointer.TOOL
+			current_tool = "TRIM"
+			if not orbit.ortho:
+				orbit.set_ortho(true)
+				flash("ORTHO ON FOR TRIM")
 		_:
 			pointer = Pointer.TOOL
 			current_tool = id
@@ -1549,6 +1583,8 @@ func _place_tool_window() -> void:
 ## down most; SCALE is uniform, by how far the pointer is from the pivot
 ## against where it started. TRANSLATE is the MOVE drag.
 func _tool_drag_begin(origin: Vector2) -> bool:
+	if current_tool == "TRIM":
+		return trim_begin(origin)
 	if not tool_live() and not tool_start(current_tool):
 		return false
 	_tool_drag_origin = origin
@@ -1563,6 +1599,9 @@ func _tool_drag_begin(origin: Vector2) -> bool:
 
 
 func _tool_drag_update(pos: Vector2) -> void:
+	if trim_drawing:
+		trim_add(pos)
+		return
 	var dx := pos.x - _tool_drag_origin.x
 	var length := dx * orbit.distance * TOOL_UNITS_PER_PX
 	match tool_kind():
@@ -2085,6 +2124,124 @@ func update_hover(pos: Vector2, radius: float) -> void:
 		hover_kind = elem if hover_index >= 0 else -1
 
 
+# --- trim ---------------------------------------------------------------------
+#
+# With TRIM the tool, a drag in the view draws a lasso (or a box) and lifting
+# cuts: everything inside the shape, straight through along the view, is cut
+# away from the selected objects (or, with KEEP INSIDE, everything outside),
+# and the cut is filled. Orthographic only, so the cut runs straight: picking
+# TRIM turns the view orthographic, and a trim drawn in perspective is
+# refused. One undo step per trim. MeshData.trim does the cutting.
+
+func trim_active() -> bool:
+	return pointer == Pointer.TOOL and current_tool == "TRIM"
+
+
+func _trim_targets() -> Array[SceneObject]:
+	var out: Array[SceneObject] = []
+	if mode == Mode.EDIT:
+		if active_object != null and active_object.data.face_count() > 0:
+			out.append(active_object)
+		return out
+	for o in sel_objects:
+		if not o.is_group and o.data.face_count() > 0:
+			out.append(o)
+	return out
+
+
+func _on_trim_bar_tapped(id: Variant) -> void:
+	match id:
+		"LASSO", "BOX": trim_shape = id
+		"CUT": trim_keep = false
+		"KEEP": trim_keep = true
+	_refresh_lists()
+
+
+func trim_begin(origin: Vector2) -> bool:
+	if not orbit.ortho:
+		flash("TRIM WORKS IN ORTHO: TAP ORTHO")
+		return false
+	if _trim_targets().is_empty():
+		flash("SELECT A MESH TO TRIM")
+		return false
+	trim_drawing = true
+	trim_points = PackedVector2Array([origin])
+	return true
+
+
+func trim_add(pos: Vector2) -> void:
+	if not trim_drawing:
+		return
+	if trim_shape == "BOX":
+		trim_points = PackedVector2Array([trim_points[0], pos])
+	elif trim_points[trim_points.size() - 1].distance_to(pos) >= 5.0:
+		trim_points.append(pos)
+
+
+func trim_cancel() -> void:
+	trim_drawing = false
+	trim_points = PackedVector2Array()
+
+
+## The outline being drawn, as a closed polygon on the screen.
+func trim_outline() -> PackedVector2Array:
+	if trim_shape == "BOX" and trim_points.size() == 2:
+		var a := trim_points[0]
+		var b := trim_points[1]
+		return PackedVector2Array([a, Vector2(b.x, a.y), b, Vector2(a.x, b.y)])
+	return trim_points
+
+
+func trim_finish() -> void:
+	if not trim_drawing:
+		return
+	var outline := trim_outline()
+	trim_cancel()
+	if not orbit.ortho:
+		flash("TRIM WORKS IN ORTHO: TAP ORTHO")
+		return
+	if outline.size() < 3 or absf(MeshData._area2(outline)) < 64.0:
+		return
+	var cam := camera()
+	var right := cam.global_basis.x
+	var up := cam.global_basis.y
+	var fwd := -cam.global_basis.z
+	# Screen to view through the same projection the overlay draws with, so
+	# the cut lands exactly under the outline the user drew. Orthographic is
+	# affine: where a point and a step right and up land fixes the rest.
+	var o3 := cam.global_position + fwd
+	var s0 := cam.unproject_position(o3)
+	var sx := cam.unproject_position(o3 + right) - s0
+	var sy := cam.unproject_position(o3 + up) - s0
+	var det := sx.x * sy.y - sx.y * sy.x
+	if absf(det) < 1e-9:
+		return
+	var shape := PackedVector2Array()
+	for p in outline:
+		var d := p - s0
+		var a := (d.x * sy.y - d.y * sy.x) / det
+		var b := (sx.x * d.y - sx.y * d.x) / det
+		shape.append(Vector2(o3.dot(right) + a, o3.dot(up) + b))
+	_tool_finish()
+	_mark_before()
+	var any := false
+	var open := 0
+	for o in _trim_targets():
+		var r := o.data.trim(o.global_transform, right, up, fwd, shape, trim_keep)
+		if r.changed:
+			any = true
+			open += int(r.open)
+			o.rebuild()
+	if not any:
+		_before = {}
+		flash("NOTHING TO TRIM")
+		return
+	if mode == Mode.EDIT:
+		_clear_elems()
+	push_undo("TRIM")
+	flash("TRIMMED" if open == 0 else "TRIMMED, %d CUT LEFT OPEN" % open)
+
+
 # --- the transform gizmo -------------------------------------------------------
 #
 # Shown at the selection's pivot while MOVE is the pointer (arrows), or the
@@ -2556,6 +2713,7 @@ func _touch(t: InputEventScreenTouch) -> void:
 				move_end()
 				_finger_moving = false
 			_finger_tooling = false
+			trim_cancel()
 			_pinch_reset()
 		elif _touches.size() > 2:
 			_touches[t.index].cancelled = true
@@ -2578,6 +2736,7 @@ func _touch(t: InputEventScreenTouch) -> void:
 		return
 	if _finger_tooling and _touches.is_empty():
 		_finger_tooling = false
+		trim_finish()
 		return
 	if _finger_moving and _touches.is_empty():
 		move_end()
@@ -2677,6 +2836,7 @@ func _pen_button(c: InputEventMouseButton) -> void:
 					move_end()
 				elif _pen_tooling:
 					_pen_tooling = false
+					trim_finish()
 				elif box_active:
 					box_active = false
 					box_select(box_rect())

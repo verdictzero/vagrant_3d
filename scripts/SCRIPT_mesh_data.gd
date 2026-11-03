@@ -126,13 +126,111 @@ func face_normal(f: int) -> Vector3:
 	return n.normalized()
 
 
-## Triangles of face `f`, fanned from its first vertex: [[a,b,c], ...].
+## Triangles of face `f`: [[a,b,c], ...], turned the way the face is. A
+## convex face fans from its first corner; one that is not (a trim's L or U,
+## a fill round a dent) is ear-clipped flat in its own plane.
 func face_triangles(f: int) -> Array:
 	var idx := faces[f]
+	var n := idx.size()
 	var out := []
-	for i in range(1, idx.size() - 1):
-		out.append([idx[0], idx[i], idx[i + 1]])
+	if n <= 3 or _convex(f):
+		for i in range(1, n - 1):
+			out.append([idx[0], idx[i], idx[i + 1]])
+		return out
+	var nrm := face_normal_raw(f)
+	if nrm.length_squared() < 1e-20:
+		for i in range(1, n - 1):
+			out.append([idx[0], idx[i], idx[i + 1]])
+		return out
+	nrm = nrm.normalized()
+	var u := nrm.cross(Vector3.RIGHT if absf(nrm.x) < 0.9 else Vector3.UP).normalized()
+	var w := nrm.cross(u)
+	var poly := PackedVector2Array()
+	for i in idx:
+		poly.append(Vector2(verts[i].dot(u), verts[i].dot(w)))
+	var tris := Geometry2D.triangulate_polygon(poly)
+	if tris.is_empty():
+		for i in range(1, n - 1):
+			out.append([idx[0], idx[i], idx[i + 1]])
+		return out
+	for k in range(0, tris.size(), 3):
+		var a := idx[tris[k]]
+		var b := idx[tris[k + 1]]
+		var c := idx[tris[k + 2]]
+		if (verts[b] - verts[a]).cross(verts[c] - verts[a]).dot(nrm) < 0.0:
+			out.append([a, c, b])
+		else:
+			out.append([a, b, c])
 	return out
+
+
+func _convex(f: int) -> bool:
+	var idx := faces[f]
+	var n := idx.size()
+	var nrm := face_normal_raw(f)
+	for i in n:
+		var a := verts[idx[i]]
+		var b := verts[idx[(i + 1) % n]]
+		var c := verts[idx[(i + 2) % n]]
+		if (b - a).cross(c - b).dot(nrm) < -1e-9:
+			return false
+	return true
+
+
+## Thread every open-edge vertex that lies on another face's open edge into
+## that edge, so no face has a corner sitting on its neighbour's side.
+func fix_t_junctions(tol: float) -> void:
+	var directed := {}
+	for f in faces:
+		for i in f.size():
+			directed[Vector2i(f[i], f[(i + 1) % f.size()])] = true
+	var open_verts := {}
+	for e in directed:
+		if not directed.has(Vector2i(e.y, e.x)):
+			open_verts[e.x] = true
+			open_verts[e.y] = true
+	if open_verts.is_empty():
+		return
+	var cands: Array = open_verts.keys()
+	var changed := false
+	for fi in faces.size():
+		var f := faces[fi]
+		var nf := PackedInt32Array()
+		var touched := false
+		for i in f.size():
+			var a := f[i]
+			var b := f[(i + 1) % f.size()]
+			nf.append(a)
+			if directed.has(Vector2i(b, a)):
+				continue
+			var ab := verts[b] - verts[a]
+			var len2 := ab.length_squared()
+			if len2 < 1e-20:
+				continue
+			var on: Array = []
+			for v in cands:
+				if v == a or v == b:
+					continue
+				var t := (verts[v] - verts[a]).dot(ab) / len2
+				if t <= 1e-6 or t >= 1.0 - 1e-6:
+					continue
+				if (verts[a] + ab * t).distance_to(verts[v]) <= tol:
+					on.append([t, v])
+			if not on.is_empty():
+				on.sort_custom(func(p, q): return p[0] < q[0])
+				for pv in on:
+					nf.append(pv[1])
+				touched = true
+		if touched:
+			faces[fi] = nf
+			changed = true
+	if changed:
+		var old := faces
+		faces = []
+		edges = []
+		_edge_index = {}
+		for f in old:
+			add_face(f)
 
 
 ## Nearest hit of a local-space ray on any face: {face, t, point} or {}.
@@ -1232,3 +1330,587 @@ func linked(sel_v: Dictionary) -> Dictionary:
 				out[w] = true
 				todo.append(w)
 	return out
+
+
+# --- trim ----------------------------------------------------------------------------
+#
+# Nomad Sculpt's trim, in an orthographic view: a shape drawn on the screen,
+# swept straight through the mesh along the view, cuts away what is inside
+# it (or, with keep_inside, what is outside), and the cut is filled so a
+# closed mesh stays closed.
+#
+#   1. Every face is clipped against the shape in view space. A face seen
+#      edge-on (its plane holds the view direction, like a cube's sides from
+#      the front) is cut instead by the shape's walls where they cross its
+#      line. Cut points are welded across faces, so neighbours stay joined.
+#   2. The cut leaves open loops lying on the shape's walls. Unrolled (how
+#      far round the shape, how deep), a loop that does not go round is a
+#      simple outline, filled as it is; a loop that goes round once (a hole
+#      through the mesh) pairs with the one going round the other way, and
+#      the strip between them is the tunnel's wall. Each fill is triangulated
+#      flat and lifted back onto the walls.
+#
+# xf is the object's transform; right, up, fwd the camera's (fwd is where it
+# looks); shape is in view coordinates (world units along right and up).
+# Returns { changed, capped, open } with how many cuts were filled and how
+# many were left open.
+
+func trim(xf: Transform3D, right: Vector3, up: Vector3, fwd: Vector3, shape: PackedVector2Array,
+		keep_inside := false) -> Dictionary:
+	var result := {"changed": false, "capped": 0, "open": 0}
+	if shape.size() < 3 or faces.is_empty():
+		return result
+	var inv := xf.affine_inverse()
+	var world := PackedVector3Array()
+	var flat := PackedVector2Array()
+	var box := AABB()
+	for i in verts.size():
+		var w := xf * verts[i]
+		world.append(w)
+		flat.append(Vector2(w.dot(right), w.dot(up)))
+		box = AABB(w, Vector3.ZERO) if i == 0 else box.expand(w)
+	var extent := maxf(box.get_longest_axis_size(), 1.0)
+	var tol := extent * 2e-4
+	var big := extent * 20.0 + 10.0
+	var s_lo := shape[0]
+	var s_hi := shape[0]
+	for p in shape:
+		s_lo = s_lo.min(p)
+		s_hi = s_hi.max(p)
+	var shape_box := Rect2(s_lo, s_hi - s_lo)
+
+	var new_world: Array[Vector3] = []
+	var weld := {}   # Vector3i cell -> Array of new indices
+	var out_faces: Array = []
+	var changed := false
+	for f in faces.size():
+		var idx := faces[f]
+		var n := idx.size()
+		var poly := PackedVector2Array()
+		var fbox := Rect2(flat[idx[0]], Vector2.ZERO)
+		for i in idx:
+			poly.append(flat[i])
+			fbox = fbox.expand(flat[i])
+		var nw := Vector3.ZERO
+		for i in n:
+			var a := world[idx[i]]
+			var b := world[idx[(i + 1) % n]]
+			nw += (a - b).cross(a + b)
+		nw = nw.normalized()
+		# Wholly outside the shape's box: untouched (or gone, keeping inside).
+		if not fbox.grow(tol).intersects(shape_box):
+			if keep_inside:
+				changed = true
+			else:
+				out_faces.append(_refs_of(idx))
+			continue
+		var pieces: Array = []   # of PackedVector3Array, world positions
+		var edge_on := absf(nw.dot(fwd)) < 1e-4
+		if edge_on:
+			pieces = _trim_edge_on(idx, world, flat, fwd, right, up, shape, keep_inside, big, tol)
+		else:
+			var cls := _trim_classify(poly, shape)
+			if cls == 0:
+				if keep_inside:
+					changed = true
+				else:
+					out_faces.append(_refs_of(idx))
+				continue
+			if cls == 1:
+				if not keep_inside:
+					changed = true
+				else:
+					out_faces.append(_refs_of(idx))
+				continue
+			var d := nw.dot(world[idx[0]])
+			for p2 in _trim_clip2d(poly, shape, keep_inside, 0):
+				var pts := PackedVector3Array()
+				for q in p2:
+					var xy: Vector3 = right * q.x + up * q.y
+					pts.append(xy + fwd * ((d - nw.dot(xy)) / nw.dot(fwd)))
+				pieces.append(pts)
+		# A face that came through whole keeps its own vertices.
+		if pieces.size() == 1 and (pieces[0] as PackedVector3Array).size() == n \
+				and _same_points(pieces[0], idx, world, tol):
+			out_faces.append(_refs_of(idx))
+			continue
+		changed = true
+		for pts in pieces:
+			var refs: Array = []
+			for w in pts:
+				var r := -1
+				for i in idx:
+					if world[i].distance_to(w) <= tol:
+						r = i
+						break
+				if r < 0:
+					r = verts.size() + _weld(new_world, weld, w, tol)
+				if refs.is_empty() or refs[refs.size() - 1] != r:
+					refs.append(r)
+			if refs.size() > 1 and refs[0] == refs[refs.size() - 1]:
+				refs.pop_back()
+			if refs.size() < 3:
+				continue
+			# Turn it the way the face it came from turns.
+			var nn := Vector3.ZERO
+			for i in refs.size():
+				var a: Vector3 = world[refs[i]] if refs[i] < verts.size() else new_world[refs[i] - verts.size()]
+				var b: Vector3 = world[refs[(i + 1) % refs.size()]] if refs[(i + 1) % refs.size()] < verts.size() \
+						else new_world[refs[(i + 1) % refs.size()] - verts.size()]
+				nn += (a - b).cross(a + b)
+			if nn.dot(nw) < 0.0:
+				refs.reverse()
+			out_faces.append(refs)
+	if not changed:
+		return result
+	for w in new_world:
+		verts.append(inv * w)
+	faces = []
+	edges = []
+	_edge_index = {}
+	for refs in out_faces:
+		add_face(PackedInt32Array(refs))
+	fix_t_junctions(tol / maxf(xf.basis.get_scale().length(), 1e-6) * 2.0)
+	compact()
+	result.changed = true
+	_trim_cap(xf, right, up, fwd, shape, tol, result)
+	return result
+
+
+static func _refs_of(idx: PackedInt32Array) -> Array:
+	return Array(idx)
+
+
+func _same_points(pts: PackedVector3Array, idx: PackedInt32Array, world: PackedVector3Array, tol: float) -> bool:
+	for w in pts:
+		var hit := false
+		for i in idx:
+			if world[i].distance_to(w) <= tol:
+				hit = true
+				break
+		if not hit:
+			return false
+	return true
+
+
+## The index among `new_world` of a point at `w`, adding it unless one is
+## already within `tol` (searching the neighbouring cells, so two points a
+## hair apart across a cell's edge still meet).
+static func _weld(new_world: Array[Vector3], cells: Dictionary, w: Vector3, tol: float) -> int:
+	var q := tol * 4.0
+	var c := Vector3i(floori(w.x / q), floori(w.y / q), floori(w.z / q))
+	for dx in [-1, 0, 1]:
+		for dy in [-1, 0, 1]:
+			for dz in [-1, 0, 1]:
+				var k := c + Vector3i(dx, dy, dz)
+				if cells.has(k):
+					for i in cells[k]:
+						if new_world[i].distance_to(w) <= tol:
+							return i
+	new_world.append(w)
+	if not cells.has(c):
+		cells[c] = []
+	cells[c].append(new_world.size() - 1)
+	return new_world.size() - 1
+
+
+## 0 wholly outside, 1 wholly inside, 2 crossing (or holding the shape).
+static func _trim_classify(poly: PackedVector2Array, shape: PackedVector2Array) -> int:
+	var n := poly.size()
+	var m := shape.size()
+	var fbox := Rect2(poly[0], Vector2.ZERO)
+	for p in poly:
+		fbox = fbox.expand(p)
+	for i in n:
+		var a := poly[i]
+		var b := poly[(i + 1) % n]
+		var ebox := Rect2(a, Vector2.ZERO).expand(b)
+		for j in m:
+			var c := shape[j]
+			var d := shape[(j + 1) % m]
+			if not ebox.intersects(Rect2(c, Vector2.ZERO).expand(d), true):
+				continue
+			if Geometry2D.segment_intersects_segment(a, b, c, d) != null:
+				return 2
+	if Geometry2D.is_point_in_polygon(poly[0], shape):
+		return 1
+	if fbox.has_point(shape[0]) and Geometry2D.is_point_in_polygon(shape[0], poly):
+		return 2
+	return 0
+
+
+## The face's outline minus (or within) the shape. A face that holds the
+## whole shape would come out with a hole, which a face cannot have, so it
+## is halved across the shape first and each half clipped on its own.
+static func _trim_clip2d(poly: PackedVector2Array, shape: PackedVector2Array, keep_inside: bool, depth: int) -> Array:
+	var res: Array = Geometry2D.intersect_polygons(poly, shape) if keep_inside else Geometry2D.clip_polygons(poly, shape)
+	if res.size() < 2 or depth > 3:
+		return res
+	var outer_cw := false
+	var best := -1.0
+	for r in res:
+		var a := absf(_area2(r))
+		if a > best:
+			best = a
+			outer_cw = Geometry2D.is_polygon_clockwise(r)
+	var has_hole := false
+	for r in res:
+		if Geometry2D.is_polygon_clockwise(r) != outer_cw:
+			has_hole = true
+	if not has_hole:
+		return res
+	var cy := 0.0
+	for p in shape:
+		cy += p.y
+	cy /= float(shape.size())
+	var lo := Vector2(INF, INF)
+	var hi := Vector2(-INF, -INF)
+	for p in poly:
+		lo = lo.min(p)
+		hi = hi.max(p)
+	var pad := (hi - lo).length() + 1.0
+	var top := PackedVector2Array([Vector2(lo.x - pad, cy), Vector2(hi.x + pad, cy), Vector2(hi.x + pad, hi.y + pad), Vector2(lo.x - pad, hi.y + pad)])
+	var bot := PackedVector2Array([Vector2(lo.x - pad, lo.y - pad), Vector2(hi.x + pad, lo.y - pad), Vector2(hi.x + pad, cy), Vector2(lo.x - pad, cy)])
+	var out: Array = []
+	for half in [top, bot]:
+		for piece in Geometry2D.intersect_polygons(poly, half):
+			out.append_array(_trim_clip2d(piece, shape, keep_inside, depth + 1))
+	return out
+
+
+static func _area2(p: PackedVector2Array) -> float:
+	var a := 0.0
+	for i in p.size():
+		a += p[i].cross(p[(i + 1) % p.size()])
+	return a * 0.5
+
+
+## An edge-on face: flat on the screen it is a line, so it is cut where the
+## shape crosses that line, by slabs square to it running the full depth.
+func _trim_edge_on(idx: PackedInt32Array, world: PackedVector3Array, flat: PackedVector2Array, fwd: Vector3,
+		right: Vector3, up: Vector3, shape: PackedVector2Array, keep_inside: bool, big: float, tol: float) -> Array:
+	var a2 := flat[idx[0]]
+	var b2 := a2
+	var far := -1.0
+	for i in idx:
+		for j in idx:
+			var d := flat[i].distance_squared_to(flat[j])
+			if d > far:
+				far = d
+				a2 = flat[i]
+				b2 = flat[j]
+	var pts := PackedVector3Array()
+	for i in idx:
+		pts.append(world[i])
+	if far <= tol * tol:
+		var inside := Geometry2D.is_point_in_polygon(a2, shape)
+		return [pts] if inside == keep_inside else []
+	var d2 := (b2 - a2).normalized()
+	var es := (right * d2.x + up * d2.y).normalized()
+	var q0 := world[idx[0]]
+	var o2 := flat[idx[0]]
+	var sz := PackedVector2Array()
+	var smin := INF
+	var smax := -INF
+	for i in idx:
+		var v := world[i] - q0
+		var s := v.dot(es)
+		sz.append(Vector2(s, v.dot(fwd)))
+		smin = minf(smin, s)
+		smax = maxf(smax, s)
+	# Where the shape's outline crosses the face's line.
+	var cuts: Array[float] = []
+	var m := shape.size()
+	var nrm := Vector2(-d2.y, d2.x)
+	for j in m:
+		var c := shape[j] - o2
+		var d := shape[(j + 1) % m] - o2
+		var hc := c.dot(nrm)
+		var hd := d.dot(nrm)
+		if (hc > 0.0) == (hd > 0.0) or is_equal_approx(hc, hd):
+			continue
+		var t := hc / (hc - hd)
+		cuts.append((c + (d - c) * t).dot(d2))
+	cuts.sort()
+	var bounds: Array[float] = [smin - 1.0]
+	bounds.append_array(cuts)
+	bounds.append(smax + 1.0)
+	var inside_spans: Array = []
+	for k in range(bounds.size() - 1):
+		var a := bounds[k]
+		var b := bounds[k + 1]
+		if b - a <= 1e-9:
+			continue
+		var mid := (a + b) * 0.5
+		if Geometry2D.is_point_in_polygon(o2 + d2 * mid, shape):
+			inside_spans.append([a, b])
+	var pieces: Array = []
+	if keep_inside:
+		for span in inside_spans:
+			var rect := PackedVector2Array([Vector2(span[0], -big), Vector2(span[1], -big), Vector2(span[1], big), Vector2(span[0], big)])
+			pieces.append_array(Geometry2D.intersect_polygons(sz, rect))
+	else:
+		pieces = [sz]
+		for span in inside_spans:
+			var rect := PackedVector2Array([Vector2(span[0], -big), Vector2(span[1], -big), Vector2(span[1], big), Vector2(span[0], big)])
+			var next: Array = []
+			for pc in pieces:
+				next.append_array(Geometry2D.clip_polygons(pc, rect))
+			pieces = next
+	var out: Array = []
+	for pc in pieces:
+		var w := PackedVector3Array()
+		for q in pc:
+			w.append(q0 + es * q.x + fwd * q.y)
+		out.append(w)
+	return out
+
+
+## Step 2: fill the open loops the cut left on the shape's walls.
+func _trim_cap(xf: Transform3D, right: Vector3, up: Vector3, fwd: Vector3, shape: PackedVector2Array,
+		tol: float, result: Dictionary) -> void:
+	var m := shape.size()
+	var cum := PackedFloat32Array([0.0])
+	for j in m:
+		cum.append(cum[j] + shape[j].distance_to(shape[(j + 1) % m]))
+	var total: float = cum[m]
+	if total <= 0.0:
+		return
+	var world := PackedVector3Array()
+	for v in verts:
+		world.append(xf * v)
+	var wall := {"total": total, "corners": cum.slice(0, m), "cum": cum, "shape": shape, "tol": tol,
+			"right": right, "up": up, "fwd": fwd, "inv": xf.affine_inverse()}
+	# How far round the shape a vertex is, and whether it is on a wall.
+	var t_of := {}
+	var on_wall := func(v: int) -> bool:
+		if t_of.has(v):
+			return t_of[v] >= 0.0
+		var p := Vector2(world[v].dot(right), world[v].dot(up))
+		var best := INF
+		var bt := -1.0
+		for j in m:
+			var a := shape[j]
+			var b := shape[(j + 1) % m]
+			var q := Geometry2D.get_closest_point_to_segment(p, a, b)
+			var d := q.distance_to(p)
+			if d < best:
+				best = d
+				bt = cum[j] + a.distance_to(q)
+		t_of[v] = bt if best <= tol * 4.0 else -1.0
+		return t_of[v] >= 0.0
+	var directed := {}
+	for f in faces:
+		for i in f.size():
+			directed[Vector2i(f[i], f[(i + 1) % f.size()])] = true
+	var hole_next := {}
+	var open_starts := {}
+	for e in directed:
+		if directed.has(Vector2i(e.y, e.x)):
+			continue
+		if on_wall.call(e.x) and on_wall.call(e.y):
+			hole_next[e.y] = e.x
+			open_starts[e.y] = true
+	var loops: Array = []
+	var seen := {}
+	for start in hole_next.keys():
+		if seen.has(start):
+			continue
+		var loop: Array[int] = []
+		var cur: int = start
+		var closed := false
+		while hole_next.has(cur) and not seen.has(cur):
+			seen[cur] = true
+			loop.append(cur)
+			cur = hole_next[cur]
+			if cur == start:
+				closed = true
+				break
+		if closed and loop.size() >= 3:
+			loops.append(loop)
+		else:
+			result.open += 1
+	# Unroll each loop: u how far round (continuous), z how deep.
+	var ups: Array = []
+	var downs: Array = []
+	for loop in loops:
+		var u := PackedFloat32Array()
+		var z := PackedFloat32Array()
+		var acc := 0.0
+		for i in loop.size():
+			var t: float = t_of[loop[i]]
+			if i == 0:
+				acc = t
+			else:
+				acc += wrapf(t - float(t_of[loop[i - 1]]), -total * 0.5, total * 0.5)
+			u.append(acc)
+			z.append(world[loop[i]].dot(fwd))
+		var close := wrapf(float(t_of[loop[0]]) - float(t_of[loop[loop.size() - 1]]), -total * 0.5, total * 0.5)
+		var turns := roundi((u[u.size() - 1] + close - u[0]) / total)
+		var rec := {"loop": loop, "u": u, "z": z, "turns": turns}
+		if turns == 0:
+			if _trim_fill(loop, u, z, wall):
+				result.capped += 1
+			else:
+				result.open += 1
+		elif turns > 0:
+			ups.append(rec)
+		else:
+			downs.append(rec)
+	# Holes through: pair the loops that go round each way, nearest in depth.
+	var mean_z := func(r: Dictionary) -> float:
+		var s := 0.0
+		for zz in r.z:
+			s += zz
+		return s / float(r.z.size())
+	ups.sort_custom(func(a, b): return mean_z.call(a) < mean_z.call(b))
+	downs.sort_custom(func(a, b): return mean_z.call(a) < mean_z.call(b))
+	for k in mini(ups.size(), downs.size()):
+		if _trim_strip(ups[k], downs[k], total, wall):
+			result.capped += 1
+		else:
+			result.open += 2
+	result.open += absi(ups.size() - downs.size())
+	# New wall vertices sit on the edges of the faces beside them.
+	fix_t_junctions(tol / maxf(xf.basis.get_scale().length(), 1e-6) * 2.0)
+
+
+## Fill one unrolled outline; triangles turned the way the loop runs.
+func _trim_fill(loop: Array, u: PackedFloat32Array, z: PackedFloat32Array, wall: Dictionary) -> bool:
+	var poly := PackedVector2Array()
+	for i in loop.size():
+		poly.append(Vector2(u[i], z[i]))
+	return _trim_add_region(poly, loop, wall)
+
+
+## The wall of a hole through: loop a goes round one way, b the other. Each
+## is opened at the pair of their vertices nearest round the shape, and the
+## strip between them is one outline: all of a, across, all of b, back.
+func _trim_strip(a: Dictionary, b: Dictionary, total: float, wall: Dictionary) -> bool:
+	var la: Array = a.loop
+	var lb: Array = b.loop
+	var best := INF
+	var ia := 0
+	var ib := 0
+	for i in la.size():
+		for j in lb.size():
+			var d := absf(wrapf(float(a.u[i]) - float(b.u[j]), -total * 0.5, total * 0.5))
+			if d < best:
+				best = d
+				ia = i
+				ib = j
+	var poly := PackedVector2Array()
+	var ids: Array = []
+	var n := la.size()
+	var ua0: float = a.u[ia]
+	for k in n + 1:
+		var i := (ia + k) % n
+		var uu: float = a.u[i] - float(a.u[ia]) + ua0
+		if i < ia:
+			uu += float(a.turns) * total
+		if k == n:
+			uu = ua0 + float(a.turns) * total
+		poly.append(Vector2(uu, a.z[i]))
+		ids.append(la[i])
+	var end_u := ua0 + float(a.turns) * total
+	var mb := lb.size()
+	var ub_start: float = b.u[ib]
+	var shift := roundf((end_u - ub_start) / total) * total
+	for k in mb + 1:
+		var j := (ib + k) % mb
+		var uu: float = b.u[j] - float(b.u[ib]) + ub_start + shift
+		if j < ib:
+			uu += float(b.turns) * total
+		if k == mb:
+			uu = ub_start + shift + float(b.turns) * total
+		poly.append(Vector2(uu, b.z[j]))
+		ids.append(lb[j])
+	return _trim_add_region(poly, ids, wall)
+
+
+## Triangulate an unrolled region slab by slab, a slab between each pair of
+## the shape's corners, so every triangle lies flat on one wall of the
+## sweep. A point a slab's edge makes mid-way along the outline becomes a
+## vertex on the wall (and is threaded into the face beside it afterwards).
+func _trim_add_region(poly: PackedVector2Array, ids: Array, wall: Dictionary) -> bool:
+	var total: float = wall.total
+	var corners: PackedFloat32Array = wall.corners
+	var tol: float = wall.tol
+	var umin := INF
+	var umax := -INF
+	var zmin := INF
+	var zmax := -INF
+	for p in poly:
+		umin = minf(umin, p.x)
+		umax = maxf(umax, p.x)
+		zmin = minf(zmin, p.y)
+		zmax = maxf(zmax, p.y)
+	var cuts: Array[float] = []
+	for k in range(floori(umin / total) - 1, ceili(umax / total) + 2):
+		for c in corners:
+			var cu := c + float(k) * total
+			if cu > umin + tol and cu < umax - tol:
+				cuts.append(cu)
+	cuts.sort()
+	var bounds: Array[float] = [umin - 1.0]
+	bounds.append_array(cuts)
+	bounds.append(umax + 1.0)
+	var pad := (zmax - zmin) + 1.0
+	var sign := _area2(poly)
+	var any := false
+	for k in range(bounds.size() - 1):
+		var rect := PackedVector2Array([Vector2(bounds[k], zmin - pad), Vector2(bounds[k + 1], zmin - pad),
+				Vector2(bounds[k + 1], zmax + pad), Vector2(bounds[k], zmax + pad)])
+		for pc in Geometry2D.intersect_polygons(poly, rect):
+			var pids: Array = []
+			for q in pc:
+				var hit := -1
+				for i in poly.size():
+					if poly[i].distance_to(q) <= tol * 4.0:
+						hit = ids[i]
+						break
+				if hit < 0:
+					hit = _trim_wall_vertex(q, wall)
+				pids.append(hit)
+			if _trim_add_triangles(pc, pids, sign):
+				any = true
+	return any
+
+
+## A new vertex on the walls at unrolled (u, z).
+func _trim_wall_vertex(q: Vector2, wall: Dictionary) -> int:
+	var shape: PackedVector2Array = wall.shape
+	var cum: PackedFloat32Array = wall.cum
+	var total: float = wall.total
+	var t := fposmod(q.x, total)
+	var m := shape.size()
+	var j := 0
+	while j < m - 1 and cum[j + 1] <= t:
+		j += 1
+	var seg := cum[j + 1] - cum[j]
+	var p2 := shape[j].lerp(shape[(j + 1) % m], (t - cum[j]) / seg if seg > 0.0 else 0.0)
+	var w: Vector3 = wall.right * p2.x + wall.up * p2.y + wall.fwd * q.y
+	return add_vert((wall.inv as Transform3D) * w)
+
+
+## Triangles of one flat piece, turned the way `sign` (the whole region's
+## winding) says, whichever way the clipper handed the piece back.
+func _trim_add_triangles(poly: PackedVector2Array, ids: Array, sign: float) -> bool:
+	var tris := Geometry2D.triangulate_polygon(poly)
+	if tris.is_empty():
+		return false
+	for k in range(0, tris.size(), 3):
+		var i0 := tris[k]
+		var i1 := tris[k + 1]
+		var i2 := tris[k + 2]
+		var a: int = ids[i0]
+		var b: int = ids[i1]
+		var c: int = ids[i2]
+		if a == b or b == c or a == c:
+			continue
+		var s := (poly[i1] - poly[i0]).cross(poly[i2] - poly[i0])
+		if (s > 0.0) != (sign > 0.0):
+			add_face(PackedInt32Array([a, c, b]))
+		else:
+			add_face(PackedInt32Array([a, b, c]))
+	return true

@@ -155,6 +155,35 @@ func _initialize() -> void:
 	await _frames(6)
 	_shot("rename")
 	ed.prompt.cancel()
+	# Trim: a lasso drawn over a cube from the front, then the tunnel it cut.
+	ed.file_new()
+	var tc = ed.add_primitive("CUBE")
+	ed.orbit.target = Vector3.ZERO
+	ed.orbit.distance = 8.0
+	ed.orbit.set_view("FRONT", false)
+	ed._on_toolbar_tapped("TRIM")
+	var cam: Camera3D = ed.camera()
+	var mid: Vector2 = cam.unproject_position(Vector3.ZERO)
+	var rad: float = (cam.unproject_position(Vector3(0.5, 0, 0)) - mid).x
+	ed.trim_drawing = true
+	ed.trim_points = PackedVector2Array()
+	for k in 40:
+		var wob := 1.0 + 0.18 * sin(k * 0.9)
+		ed.trim_points.append(mid + Vector2(cos(TAU * k / 40.0), sin(TAU * k / 40.0)) * rad * wob)
+	ed._refresh_lists()
+	await _frames(6)
+	_shot("trim_draw")
+	ed.trim_finish()
+	ed.orbit.set_ortho(false)
+	ed.orbit.yaw = -0.22
+	ed.orbit.pitch = -0.16
+	ed.orbit.distance = 6.5
+	ed.orbit.apply()
+	ed.pointer = ed.Pointer.SELECT
+	ed.clear_object_selection()
+	ed._refresh_lists()
+	await _frames(6)
+	_shot("trim_done")
 	quit(0)
 
 
