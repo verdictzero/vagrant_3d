@@ -61,6 +61,9 @@ func _initialize() -> void:
 	await _loopcut_and_duplicate()
 	await _select_menu()
 	await _files()
+	await _modifiers()
+	await _names()
+	await _merge_fill()
 	print("editor: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -1228,3 +1231,184 @@ func _files() -> void:
 			"in world space")
 	for n in SceneFile.list():
 		SceneFile.delete(n)
+
+
+func _prop_row(id: String) -> Vector2:
+	ed._refresh_props()
+	var i: int = ed.props_list.index_of(id)
+	# Scroll it into view first, the way a finger would.
+	var r: Rect2 = ed.props_list.row_rect(i)
+	if r.position.y < 0.0 or r.end.y > ed.props_list.size.y:
+		ed.props_list.set_scroll(ed.props_list.scroll + r.position.y - 10.0)
+		r = ed.props_list.row_rect(i)
+	return ed.props_list.global_position + r.get_center()
+
+
+func _modifiers() -> void:
+	ed.file_new()
+	var c: Node3D = ed.add_primitive("CUBE")
+	await _settle()
+	ed._refresh_props()
+	ok(ed.props_list.index_of("addmod") >= 0 and ed.props_list.index_of("smooth") >= 0,
+			"a mesh's properties have SHADE SMOOTH and ADD MODIFIER")
+	_pen_tap(_prop_row("addmod"))
+	await _settle()
+	ok(ed.popover.visible and ed.popover_kind == "MODIFIER", "ADD MODIFIER opens the list")
+	var row: Vector2 = ed.modifier_menu.global_position + ed.modifier_menu.row_rect(ed.modifier_menu.index_of("SUBDIVISION")).get_center()
+	_pen_tap(row)
+	await _settle()
+	ok(c.modifiers.size() == 1 and c.modifiers[0].type == "SUBDIVISION", "a tap adds SUBDIVISION")
+	ok(c.evaluated.face_count() == 24 and c.data.face_count() == 6, "the view shows 24 faces, the cage keeps 6")
+	ok(c.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size() == 24 * 6, "and draws them")
+	ok(ed.history_label() == "ADD SUBDIVISION", "as an undo step")
+	# Levels: drag the field right.
+	var lv := _prop_row("m0:levels")
+	_pen_drag(lv, lv + Vector2(45, 0))
+	await _settle()
+	ok(int(c.modifiers[0].levels) == 2 and c.evaluated.face_count() == 96, "dragging LEVELS right makes it 2: 96 faces")
+	ok(ed.history_label() == "MODIFIER", "one step for the drag")
+	_pen_tap(_prop_row("m0:show"))
+	ok(not c.modifiers[0].show and c.evaluated.face_count() == 6, "tapping its name hides it")
+	_pen_tap(_prop_row("m0:show"))
+	# Mirror on top.
+	ed.add_modifier("MIRROR")
+	ok(c.modifiers.size() == 2 and c.modifiers[1].axes == [true, false, false], "MIRROR comes in on X")
+	ok(c.evaluated.face_count() == 96 * 2, "a cube across the plane mirrors to twice the faces (%d)" % c.evaluated.face_count())
+	_pen_tap(_prop_row("m1:ax1"))
+	ok(c.modifiers[1].axes[1] and c.evaluated.face_count() == 96 * 4, "Y too: four times (%d)" % c.evaluated.face_count())
+	_pen_tap(_prop_row("m1:remove"))
+	ok(c.modifiers.size() == 1, "REMOVE takes it off")
+	# Array.
+	ed.add_modifier("ARRAY")
+	ok(c.evaluated.face_count() == 96 * 2, "ARRAY of 2")
+	_pen_tap(_prop_row("m1:axis"))
+	ok(int(c.modifiers[1].axis) == 1, "tapping AXIS steps it to Y")
+	var cnt := _prop_row("m1:count")
+	_pen_drag(cnt, cnt + Vector2(30, 0))
+	ok(int(c.modifiers[1].count) == 3 and c.evaluated.face_count() == 96 * 3, "dragging COUNT makes 3 (%d)" % int(c.modifiers[1].count))
+	# Apply the subdivision: the cage takes it on.
+	_pen_tap(_prop_row("m0:apply"))
+	ok(c.modifiers.size() == 1 and c.modifiers[0].type == "ARRAY", "APPLY takes SUBDIVISION off the stack")
+	ok(c.data.face_count() == 96, "and into the cage (%d faces)" % c.data.face_count())
+	ed.undo()
+	c = ed.active_object
+	ok(c.data.face_count() == 6 and c.modifiers.size() == 2, "undo puts the stack and the cage back")
+	ok(c.modifiers[0].type == "SUBDIVISION" and int(c.modifiers[0].levels) == 2, "as they were")
+	# Shading.
+	_pen_tap(_prop_row("smooth"))
+	ok(c.smooth and ed.history_label() == "SHADE SMOOTH", "SHADE SMOOTH is a toggle and a step")
+	# The array's copies touch, so hide it: one piece, one normal per corner.
+	c.modifiers[1].show = false
+	c.rebuild()
+	var nrm: PackedVector3Array = c.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_NORMAL]
+	var pos: PackedVector3Array = c.mesh_instance.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX]
+	var by_pos := {}
+	var split := false
+	for k in pos.size():
+		var key := Vector3(snappedf(pos[k].x, 0.0001), snappedf(pos[k].y, 0.0001), snappedf(pos[k].z, 0.0001))
+		if by_pos.has(key) and not by_pos[key].is_equal_approx(nrm[k]):
+			split = true
+		by_pos[key] = nrm[k]
+	ok(not split, "smooth: one normal per corner")
+	c.modifiers[1].show = true
+	c.rebuild()
+	# A file keeps it all.
+	ed.file_save_as("MODS")
+	ed.file_new()
+	ed.file_open("MODS")
+	var back: Node3D = ed.objects()[0]
+	ok(back.modifiers.size() == 2 and int(back.modifiers[0].levels) == 2 and int(back.modifiers[1].count) == 3,
+			"saved and opened, the stack is there (%s)" % str(back.modifiers))
+	ok(back.smooth and back.evaluated.face_count() == 96 * 3, "and the shading and the result")
+	# OBJ exports what shows.
+	var text := SceneFile.obj_text([back])
+	ok(text.count("\nf ") == 96 * 3, "OBJ export writes the result, modifiers applied (%d faces)" % text.count("\nf "))
+	SceneFile.delete("MODS")
+
+
+func _names() -> void:
+	ed.file_new()
+	var c: Node3D = ed.add_primitive("CUBE")
+	ed.add_primitive("SPHERE")
+	ed.select_object(c)
+	await _settle()
+	var r := _row_center(ed.hierarchy, 0)
+	_pen_tap(r)
+	_pen_tap(r)
+	await _settle()
+	ok(ed.prompt.visible and ed.prompt.line.text == "Cube", "a double tap on the active row asks for a name")
+	ed.prompt.line.text = "Box"
+	var ok_at: Vector2 = ed.prompt.buttons.global_position + ed.prompt.buttons.row_rect(0).get_center()
+	_pen_tap(ok_at)
+	await _settle()
+	ok(not ed.prompt.visible and c.name == "Box", "OK renames it (%s)" % c.name)
+	ok(ed.hierarchy.items[0].text == "Box" and ed.history_label() == "RENAME", "in the hierarchy, as a step")
+	ok(ed.props_list.items[0].text == "Box", "and in the properties")
+	ed.undo()
+	ok(ed.objects()[0].name == "Cube", "undo gives the old name back")
+	ed.redo()
+	c = ed.objects()[0]
+	ed.select_object(c)
+	ok(ed.rename_object(c, "Sphere") and c.name == "Sphere 001", "a name in use gets a number (%s)" % c.name)
+	ok(ed.rename_object(c, "a.b:c/d") and c.name == "abcd", "characters a node name cannot hold are dropped (%s)" % c.name)
+	ok(not ed.rename_object(c, "   "), "an empty name is refused")
+	# The properties' name row asks too; CANCEL leaves it.
+	_pen_tap(_prop_row("rename"))
+	ok(ed.prompt.visible, "tapping the name in the properties asks")
+	ed.prompt.line.text = "Nope"
+	ed.prompt.cancel()
+	ok(c.name == "abcd", "CANCEL changes nothing")
+	_key(KEY_F2)
+	ok(ed.prompt.visible, "F2 asks as well")
+	ed.prompt.cancel()
+	# SAVE AS with a typed name.
+	_pen_tap(_row_center(ed.file_bar, 0))
+	await _settle()
+	var sa: Vector2 = ed.file_menu.global_position + ed.file_menu.row_rect(ed.file_menu.index_of("SAVE AS")).get_center()
+	_pen_tap(sa)
+	await _settle()
+	ok(ed.prompt.visible and ed.prompt.line.text == SceneFile.next_name(), "SAVE AS... asks, offering the next free name")
+	ed.prompt.line.text = "My Room/1"
+	ed.prompt._ok()
+	ok(ed.scene_name == "My Room1" and FileAccess.file_exists(SceneFile.path_of("My Room1")), "and saves under the name given, made safe (%s)" % ed.scene_name)
+	SceneFile.delete("My Room1")
+
+
+func _merge_fill() -> void:
+	ed.file_new()
+	var c: Node3D = ed.add_primitive("CUBE")
+	ed.set_mode(ed.Mode.EDIT)
+	ed.set_elem(ed.Elem.VERT)
+	ed.select_verts({4: true, 5: true, 6: true, 7: true})
+	await _settle()
+	ok(not ed.toolbar.items[ed.toolbar.index_of("MERGE")].disabled, "MERGE is live with four verts")
+	var p := _row_center(ed.toolbar, ed.toolbar.index_of("MERGE"))
+	_finger(0, p, true)
+	_finger(0, p, false)
+	await _settle()
+	ok(c.data.vert_count() == 5 and ed.sel_verts.size() == 1, "MERGE pulls them into one (%d v)" % c.data.vert_count())
+	ok(ed.history_label() == "MERGE", "as a step")
+	ed.undo()
+	c = ed.active_object
+	ok(c.data.vert_count() == 8, "undone")
+	# Delete the top face's... remove the top, then FILL it back.
+	ed.set_elem(ed.Elem.FACE)
+	c.data.remove_faces({1: true})
+	c.rebuild()
+	ed.set_elem(ed.Elem.VERT)
+	ed.select_verts({4: true, 5: true, 6: true, 7: true})
+	_key(KEY_F)
+	ok(c.data.face_count() == 6 and ed.sel_faces.size() == 1, "F fills the hole and selects the new face")
+	ok(c.data.face_normal(ed.sel_faces.keys()[0]).y > 0.99, "facing out")
+	# Linked: a duplicated part is its own island.
+	ed.select_verts({0: true})
+	ed.select_all("LINKED")
+	ok(ed.sel_verts.size() == 8, "LINKED from one corner takes the whole cube")
+	ed.select_verts({0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true})
+	ed.duplicate_selected()
+	var copies: Dictionary = ed.sel_verts.duplicate()
+	ed.select_verts({copies.keys()[0]: true})
+	_key(KEY_L)
+	ok(ed.sel_verts.size() == 8 and ed.sel_verts.keys().all(func(v): return copies.has(v)),
+			"L from a copy takes the copy only")
+	ed.set_mode(ed.Mode.OBJECT)

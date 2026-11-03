@@ -3,6 +3,13 @@ extends Node3D
 ## One object in the scene: a MeshData and the MeshInstance3D that shows it,
 ## or a GROUP, which is an object with no mesh that exists to hold children.
 ## The hierarchy IS the node tree: a child SceneObject is a parented object.
+##
+## `data` is the cage you edit. `modifiers` run on it in order, and what
+## the view draws is the result, `evaluated`; nothing changes the cage until
+## a modifier is applied. Each modifier is a Dictionary:
+##   { type: "SUBDIVISION", show, levels }
+##   { type: "MIRROR", show, axes: [x, y, z] }
+##   { type: "ARRAY", show, count, axis, gap }
 
 const MATCAP_SHADER := preload("res://shaders/SHADER_matcap.gdshader")
 
@@ -12,6 +19,54 @@ static var matcap_index := 0
 var data: MeshData
 var mesh_instance: MeshInstance3D
 var is_group := false
+var modifiers: Array = []
+var smooth := false
+var evaluated: MeshData
+## The object-mode wire, worked out once per rebuild: each edge's ends and
+## the faces either side of it (as centre and normal), so the overlay can
+## draw only the edges of faces turned to the camera.
+var wire: Array = []
+
+const MODIFIER_TYPES := ["SUBDIVISION", "MIRROR", "ARRAY"]
+const MAX_LEVELS := 3
+
+
+static func new_modifier(type: String) -> Dictionary:
+	match type:
+		"SUBDIVISION": return {"type": type, "show": true, "levels": 1}
+		"MIRROR": return {"type": type, "show": true, "axes": [true, false, false]}
+		"ARRAY": return {"type": type, "show": true, "count": 2, "axis": 0, "gap": 1.0}
+	return {}
+
+
+static func apply_modifier(m: MeshData, mod: Dictionary) -> MeshData:
+	match mod.type:
+		"SUBDIVISION":
+			return m.subdivided(clampi(int(mod.levels), 0, MAX_LEVELS))
+		"MIRROR":
+			var out := m
+			for a in 3:
+				if mod.axes[a]:
+					out = out.mirrored(a)
+			return out
+		"ARRAY":
+			return m.arrayed(int(mod.count), int(mod.axis), float(mod.gap))
+	return m
+
+
+## The cage with every shown modifier run on it.
+func evaluate() -> MeshData:
+	var m := data
+	for mod in modifiers:
+		if mod.get("show", true):
+			m = apply_modifier(m, mod)
+	return m
+
+
+## What the overlay draws as this object's wire in OBJECT mode: the result,
+## unless that is too many lines to draw every frame, then the cage.
+func display_mesh() -> MeshData:
+	return evaluated if evaluated != null and evaluated.edge_count() <= 3000 else data
 
 
 static func create(object_name: String, mesh_data: MeshData) -> SceneObject:
@@ -47,7 +102,25 @@ static func set_matcap(i: int) -> void:
 
 
 func rebuild() -> void:
-	mesh_instance.mesh = data.build_mesh()
+	evaluated = evaluate()
+	mesh_instance.mesh = evaluated.build_mesh(smooth)
+	_build_wire()
+
+
+func _build_wire() -> void:
+	wire = []
+	var m := display_mesh()
+	var efm := m.edge_face_map()
+	var fc := PackedVector3Array()
+	var fn := PackedVector3Array()
+	for f in m.face_count():
+		fc.append(m.face_center(f))
+		fn.append(m.face_normal(f))
+	for e in efm:
+		var sides := []
+		for f in efm[e]:
+			sides.append([fc[f], fn[f]])
+		wire.append([m.verts[e.x], m.verts[e.y], sides])
 
 
 func has_mesh() -> bool:

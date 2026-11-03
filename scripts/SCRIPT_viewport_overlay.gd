@@ -105,11 +105,27 @@ func _draw_object_mode(cam: Camera3D) -> void:
 		_draw_wire(cam, editor.active_object, T.COL_CURSOR, 1.5)
 
 
+## An object's wire in OBJECT mode: only edges with a face turned to the
+## camera (and loose edges), the way Blender outlines what you can see.
 func _draw_wire(cam: Camera3D, o: SceneObject, col: Color, width: float) -> void:
 	var xf := o.global_transform
-	for e in o.data.edges:
-		var a := xf * o.data.verts[e.x]
-		var b := xf * o.data.verts[e.y]
+	var inv := xf.affine_inverse()
+	var eye := inv * cam.global_position
+	var look := (inv.basis * -cam.global_basis.z).normalized()
+	var ortho := cam.projection == Camera3D.PROJECTION_ORTHOGONAL
+	for w in o.wire:
+		var sides: Array = w[2]
+		var seen := sides.is_empty()
+		for sd in sides:
+			var n: Vector3 = sd[1]
+			var facing := -look.dot(n) > 0.0 if ortho else (eye - (sd[0] as Vector3)).dot(n) > 0.0
+			if facing:
+				seen = true
+				break
+		if not seen:
+			continue
+		var a: Vector3 = xf * (w[0] as Vector3)
+		var b: Vector3 = xf * (w[1] as Vector3)
 		if cam.is_position_behind(a) or cam.is_position_behind(b):
 			continue
 		draw_line(cam.unproject_position(a), cam.unproject_position(b), col, width)

@@ -25,6 +25,8 @@ func _initialize() -> void:
 	_loopcut()
 	_duplicate()
 	_dict()
+	_modifiers()
+	_merge_fill_linked()
 	print("mesh data: %d failure(s)" % fails)
 	quit(1 if fails > 0 else 0)
 
@@ -318,3 +320,84 @@ func _dict() -> void:
 	ok(back.vert_count() == m.vert_count() and back.edge_count() == m.edge_count() and back.face_count() == m.face_count(),
 			"a mesh survives JSON, wire edge and all (%d v %d e %d f)" % [back.vert_count(), back.edge_count(), back.face_count()])
 	ok(back.verts[3].is_equal_approx(m.verts[3]) and back.faces[2] == m.faces[2], "positions and faces the same")
+
+
+func _modifiers() -> void:
+	var m := MeshData.make_cube().catmull_clark()
+	ok(m.vert_count() == 26 and m.face_count() == 24, "a cube subdivided once: 26 v, 24 f (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "subdivided cube")
+	_outward_all(m, Vector3.ZERO, "subdivided cube")
+	ok(m.verts[6].is_equal_approx(Vector3(5, 5, 5) / 9.0), "a corner moves in to 5/9 (%s)" % m.verts[6])
+	var m2 := MeshData.make_cube().subdivided(2)
+	ok(m2.face_count() == 96, "twice: 96 faces (%d)" % m2.face_count())
+	var r := 0.0
+	for v in m2.verts:
+		r = maxf(r, v.length())
+	ok(r < 1.0, "and rounder than the cube's corners (%.3f)" % r)
+	var p := MeshData.make_plane().catmull_clark()
+	ok(p.face_count() == 4, "a plane subdivided: 4 quads")
+	var corner := false
+	for v in p.verts:
+		corner = corner or v.is_equal_approx(Vector3(-0.75, 0, -0.75))
+	ok(corner, "its corner pulled in along the border by the boundary rule")
+	ok(MeshData.make_sphere().subdivided(0).face_count() == 128, "level 0 is the mesh as it is")
+	# Mirror: a cube moved to sit on the plane shares its plane face's verts.
+	var half := MeshData.make_cube()
+	for i in half.verts.size():
+		half.verts[i].x += 1.0
+	var mm := half.mirrored(0)
+	ok(mm.vert_count() == 12 and mm.face_count() == 11, "mirrored on X: 12 v, 11 f, joined at the plane (%d, %d)" % [mm.vert_count(), mm.face_count()])
+	var neg := 0
+	for f in range(6, mm.face_count()):
+		if mm.face_normal(f).dot(mm.face_center(f) - Vector3(-1, 0, 0)) > 0.0:
+			neg += 1
+	ok(neg == 5, "the mirrored faces face outward too (%d of 5)" % neg)
+	var apart := MeshData.make_cube().mirrored(0)
+	ok(apart.vert_count() == 16, "a cube across the plane mirrors to two overlapping (%d v)" % apart.vert_count())
+	# Array.
+	var arr := MeshData.make_cube().arrayed(3, 0, 1.0)
+	ok(arr.vert_count() == 24 and arr.face_count() == 18, "an array of 3: 24 v, 18 f")
+	var hi := -INF
+	for v in arr.verts:
+		hi = maxf(hi, v.x)
+	ok(is_equal_approx(hi, 5.0), "touching end to end, out to x 5 (%.2f)" % hi)
+	ok(MeshData.make_cube().arrayed(1, 0, 1.0).vert_count() == 8, "a count of 1 is the mesh")
+	# Smooth normals.
+	var mesh := MeshData.make_cube().build_mesh(true)
+	var nrm: PackedVector3Array = mesh.surface_get_arrays(0)[Mesh.ARRAY_NORMAL]
+	ok(nrm[0].is_equal_approx(Vector3(-1, -1, -1).normalized()) or absf(absf(nrm[0].x) - 0.57735) < 0.001,
+			"smooth: a cube corner's normal is the diagonal (%s)" % nrm[0])
+
+
+func _merge_fill_linked() -> void:
+	var m := MeshData.make_cube()
+	var kept := m.merge_at_center({4: true, 5: true, 6: true, 7: true})
+	ok(m.vert_count() == 5 and m.face_count() == 5, "merging the top's corners: a pyramid, 5 v 5 f (%d, %d)" % [m.vert_count(), m.face_count()])
+	_closed(m, "merged")
+	ok(m.verts[kept].is_equal_approx(Vector3(0, 1, 0)), "the point at their centre")
+	_outward_all(m, Vector3(0, -0.5, 0), "merged")
+	# Fill a hole.
+	m = MeshData.make_cube()
+	m.remove_faces({1: true})
+	var top := {}
+	var top_edges := {}
+	for pair in [[4, 5], [5, 6], [6, 7], [7, 4]]:
+		top_edges[m.edge_index(pair[0], pair[1])] = true
+		top[pair[0]] = true
+	var f := m.fill(top, top_edges)
+	ok(f >= 0 and m.face_count() == 6, "filling the open top closes it")
+	_closed(m, "filled")
+	ok(m.face_normal(f).y > 0.99, "with the new face facing out")
+	# Without edges, by angle round the centre.
+	m = MeshData.make_cube()
+	m.remove_faces({1: true})
+	f = m.fill(top, {})
+	ok(f >= 0 and m.face_normal(f).y > 0.99 and m.faces[f].size() == 4, "from verts alone too, facing out")
+	_closed(m, "filled from verts")
+	# Two verts: an edge.
+	m = MeshData.make_cube()
+	ok(m.fill({0: true, 6: true}, {}) == -2 and m.edge_index(0, 6) >= 0, "two verts get an edge")
+	# Linked.
+	m = MeshData.make_cube()
+	m.duplicate_selection({0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true})
+	ok(m.linked({0: true}).size() == 8, "linked from one vertex finds its own cube, not the copy")

@@ -2,7 +2,8 @@
 
 Objects and groups in a hierarchy, four primitives, OBJECT and EDIT mode
 with VERT / EDGE / FACE, move, rotate, scale, extrude, inset, bevel, loop
-cut and duplicate, transform gizmos, undo and redo, saving and OBJ export,
+cut, duplicate, merge and fill, modifiers (subdivision, mirror, array),
+smooth shading, transform gizmos, undo and redo, saving and OBJ export,
 snapping, matcaps. Android first,
 S Pen aware, laid out for a tablet or a foldable. The UI speaks the house
 style: `DOC_ui_style.md` is the why, `DOC_ui_design_tokens.md` the numbers.
@@ -22,6 +23,7 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 | `scripts/SCRIPT_matcaps.gd`, `scripts/SCRIPT_matcap_grid.gd` | The sixteen matcaps and the gallery |
 | `shaders/SHADER_matcap.gdshader` | The matcap shader |
 | `scripts/SCRIPT_transform_gizmo.gd` | The move, rotate and scale gizmos: geometry, picking, drawing |
+| `scripts/SCRIPT_text_prompt.gd` | The one-line text question: a field, OK, CANCEL |
 | `scripts/SCRIPT_scene_file.gd` | Scenes as JSON in user://scenes/, and OBJ export |
 | `scripts/SCRIPT_tool_window.gd` | The tool window: a slider and a number per property, APPLY, CANCEL |
 | `scripts/SCRIPT_viewport_overlay.gd` | Wires, selection, hover, the box, the snap mark, group axes, the status line |
@@ -35,7 +37,7 @@ This project's design space is 1600x900, the sheet's 1280x720 at 0.8.
 ## The screen
 
 Blender's shape. The header across the top: FILE, OBJECT / EDIT, VERT /
-EDGE / FACE, SELECT (all, none, invert), ADD (the primitives and GROUP), and
+EDGE / FACE, SELECT (all, none, invert, linked), ADD (the primitives and GROUP), and
 at the right end UNDO and REDO, then SNAP and SHADING. FILE, SELECT, ADD,
 SNAP and SHADING open popovers under it. The tool column down the left,
 icons only, changing with the mode. The hierarchy over the properties down
@@ -79,12 +81,35 @@ parent, and a parent with more children below carries its line past them.
 When the rows outgrow the panel, a drag up or down them scrolls, as does
 the bar at the right edge or a wheel.
 
-The properties panel under it shows the active object: its name and type,
-location, rotation and scale, and mesh counts or child count. Location,
+The properties panel under it shows the active object: its name (tap it to
+rename), location, rotation and scale, SHADE SMOOTH, the modifier stack, and
+the mesh's counts, or a group's child count. Location,
 rotation and scale are fields, the way Blender's are: drag one sideways to
 change it, a hundredth of a unit, half a degree or half a percent per
-pixel. Each drag is one undo step. The rest will grow into Blender's
-properties editor.
+pixel. Each drag is one undo step.
+
+**Renaming.** Double-tap the active object's row in the hierarchy, tap its
+name in the properties, or press F2: a field comes up with the on-screen
+keyboard. A name in use gets the next free number; characters a name cannot
+hold (`. : @ / " %`) are dropped.
+
+## Modifiers
+
+As in Blender, a mesh object keeps the cage you edit and shows the result
+of its modifiers run on it in order. ADD MODIFIER in the properties offers:
+
+| Modifier | Settings | Does |
+|---|---|---|
+| SUBDIVISION | LEVELS 0 to 3 | Catmull-Clark. Every face becomes a quad per corner, each level; a border keeps its line |
+| MIRROR | AXIS X, Y, Z | Mirrors across the object's own planes through its origin; vertices on a plane are shared, so the halves join |
+| ARRAY | COUNT, AXIS, OFFSET | Copies in a row along an axis, each the mesh's own width times OFFSET from the last (1 is touching) |
+
+Tap a modifier's name to hide or show it. Its settings hang under it: drag
+LEVELS, COUNT or OFFSET sideways, or tap LEVELS and COUNT to step them; tap
+an AXIS. APPLY runs that modifier into the cage and takes it off the stack;
+REMOVE takes it off. Every change is an undo step, and files keep the
+stack. Edit mode edits the cage, drawn as the wire over the result; EXPORT
+OBJ writes the result.
 
 **Groups** are objects with no mesh. ADD > GROUP with objects selected wraps
 them: the group sits at their centre and they become its children. With
@@ -108,8 +133,9 @@ While a move is held to a target, a square mark sits on it in the view.
 ## Tools and the tool window
 
 The tool column on the left is SELECT, MOVE, then the tools the mode has,
-then DUPLICATE and DELETE. In OBJECT mode: ROTATE, SCALE. In EDIT mode:
-ROTATE, SCALE, EXTRUDE, EXTRUDE NORMALS, INSET, BEVEL and LOOP CUT. A tool
+then the one-tap actions: DUPLICATE, in EDIT also MERGE and FILL, and
+DELETE. In OBJECT mode the tools are ROTATE and SCALE; in EDIT mode ROTATE,
+SCALE, EXTRUDE, EXTRUDE NORMALS, INSET, BEVEL and LOOP CUT. A tool or action
 that cannot run on what is selected is dimmed. Select something, tap a tool: it runs at once at zero
 and the **tool window** comes up in the bottom-left of the view: the tool's
 name, one row per property with a slider to pull and the value as a number,
@@ -135,6 +161,11 @@ selection, a mode change or another tool, applies the live one first.
 `scripts/SCRIPT_editor.gd` under "tools", and the extrude operations are
 `MeshData.extrude_begin` / `extrude_set` in `scripts/SCRIPT_mesh_data.gd`.
 
+MERGE pulls the selected vertices into one at their centre; faces left with
+two corners go. FILL is Blender's F: two vertices get an edge; edges round a
+hole close it with a face; otherwise the vertices make a face in order round
+their centre. A new face turns the way the faces beside it do.
+
 DUPLICATE copies the selection in place (objects with their children, or
 in EDIT the selected faces, edges and vertices) and leaves MOVE as the
 pointer, so the next drag moves the copy.
@@ -152,8 +183,9 @@ tool window and it stays live: drag X, then Y, and both are one move.
 
 ## Files
 
-FILE has NEW, SAVE, SAVE AS NEW, the saved scenes to OPEN, and EXPORT OBJ.
-Scenes save to the app's own storage, named SCENE 001 and on; the status
+FILE has NEW, SAVE, SAVE AS... (a name of your own; the next free SCENE 001
+is offered), the saved scenes to OPEN, and EXPORT OBJ. Scenes save to the
+app's own storage; the status
 line leads with the name, and a star while there are unsaved changes. NEW
 and OPEN are undo steps, so the scene before is an undo away. EXPORT OBJ
 writes every mesh in world space to Documents/Vagrant3D/ (desktop Blender
@@ -173,9 +205,9 @@ history keeps 64 steps. Changing mode, selection or view is not a step.
 ## Keys
 
 For a keyboard on the tablet or at a desk, Blender's: Tab, 1 2 3, G R S,
-E, I, Ctrl+B, Ctrl+R, Shift+D, X or Delete, A, Alt+A, Ctrl+I, Shift+A,
-Enter, Escape, Ctrl+Z, Ctrl+Shift+Z, Ctrl+S (Shift for a new file), Ctrl+N,
-Ctrl+O, numpad 1 3 7 (with Ctrl for the opposite) and numpad 5.
+E, I, Ctrl+B, Ctrl+R, Shift+D, M, F, L, X or Delete, A, Alt+A, Ctrl+I,
+Shift+A, F2, Enter, Escape, Ctrl+Z, Ctrl+Shift+Z, Ctrl+S, Ctrl+Shift+S,
+Ctrl+N, Ctrl+O, numpad 1 3 7 (with Ctrl for the opposite) and numpad 5.
 
 ## Shading
 

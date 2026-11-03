@@ -133,6 +133,28 @@ func _initialize() -> void:
 	_shot("file")
 	for n in SceneFile.list():
 		SceneFile.delete(n)
+	ed.close_popover()
+	# A subdivided, smooth cube off to one side, mirrored across X.
+	ed.file_new()
+	var box = ed.add_primitive("CUBE")
+	for i in box.data.verts.size():
+		box.data.verts[i].x += 1.6
+	box.rebuild()
+	ed.add_modifier("SUBDIVISION")
+	box.modifiers[0].levels = 2
+	ed.add_modifier("MIRROR")
+	box.smooth = true
+	box.rebuild()
+	ed.orbit.target = Vector3.ZERO
+	ed.orbit.distance = 9.0
+	ed.orbit.apply()
+	ed._refresh_lists()
+	await _frames(6)
+	_shot("modifiers")
+	ed.ask_rename()
+	await _frames(6)
+	_shot("rename")
+	ed.prompt.cancel()
 	quit(0)
 
 

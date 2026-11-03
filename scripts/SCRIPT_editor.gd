@@ -19,6 +19,7 @@ const Grid := preload("res://scripts/SCRIPT_matcap_grid.gd")
 const ToolWin := preload("res://scripts/SCRIPT_tool_window.gd")
 const Gizmo := preload("res://scripts/SCRIPT_nav_gizmo.gd")
 const XGizmo := preload("res://scripts/SCRIPT_transform_gizmo.gd")
+const Prompt := preload("res://scripts/SCRIPT_text_prompt.gd")
 
 enum Mode { OBJECT, EDIT }
 enum Elem { VERT, EDGE, FACE }
@@ -45,7 +46,8 @@ const TOOLBAR := {
 		["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
 	Mode.EDIT: [["SELECT", &"select"], ["MOVE", &"move"], ["ROTATE", &"rotate"], ["SCALE", &"scale"],
 		["EXTRUDE", &"extrude"], ["EXTRUDE NORMALS", &"extrude_normals"], ["INSET", &"inset"],
-		["BEVEL", &"bevel"], ["LOOP CUT", &"loopcut"], ["DUPLICATE", &"duplicate"], ["DELETE", &"delete"]],
+		["BEVEL", &"bevel"], ["LOOP CUT", &"loopcut"], ["DUPLICATE", &"duplicate"], ["MERGE", &"merge"],
+		["FILL", &"fill"], ["DELETE", &"delete"]],
 }
 const TOOL_UNITS_PER_PX := 0.0025   # times the camera distance
 const ROT_DEG_PER_PX := 0.5
@@ -148,6 +150,9 @@ var file_bar: RowList
 var file_menu: RowList
 var select_bar: RowList
 var select_menu: RowList
+var modifier_menu: RowList
+var prompt: TextPrompt
+var _prompt_for := ""
 var overlay: ViewportOverlay
 var popover: ChamferPanel
 var popover_kind := ""
@@ -320,10 +325,24 @@ func _build_ui() -> void:
 	ui.add_child(file_menu)
 	select_menu = Rows.new()
 	select_menu.set_items([{"id": "ALL", "text": "ALL"}, {"id": "NONE", "text": "NONE"},
-			{"id": "INVERT", "text": "INVERT"}])
+			{"id": "INVERT", "text": "INVERT"}, {"id": "LINKED", "text": "LINKED"}])
 	select_menu.tapped.connect(_on_select_tapped)
 	select_menu.visible = false
 	ui.add_child(select_menu)
+	modifier_menu = Rows.new()
+	var mods: Array[Dictionary] = []
+	for t in SceneObject.MODIFIER_TYPES:
+		mods.append({"id": t, "text": t, "icon": _modifier_icon(t)})
+	modifier_menu.set_items(mods)
+	modifier_menu.tapped.connect(_on_modifier_menu_tapped)
+	modifier_menu.visible = false
+	ui.add_child(modifier_menu)
+	props_list.tapped.connect(_on_prop_tapped)
+	hierarchy.double_tapped.connect(_on_hierarchy_double_tapped)
+	prompt = Prompt.new()
+	prompt.submitted.connect(_on_prompt_submitted)
+	prompt.cancelled.connect(func() -> void: _prompt_for = "")
+	ui.add_child(prompt)
 	xgizmo.camera = camera()
 	matcap_grid = Grid.new()
 	matcap_grid.picked.connect(_on_matcap_picked)
@@ -402,6 +421,8 @@ func _layout() -> void:
 			gizmo.position.y + NavGizmo.SIZE)
 	_place_tool_window()
 	_place_popover()
+	if prompt != null:
+		prompt.position = Vector2(view_rect.get_center().x - TextPrompt.W * 0.5, view_rect.position.y + 60.0)
 
 
 func _refresh_lists() -> void:
@@ -438,6 +459,8 @@ func _refresh_lists() -> void:
 	_refresh_snap_menu()
 	_refresh_file_menu()
 	_refresh_props()
+	if select_menu != null:
+		select_menu.items[3].disabled = mode != Mode.EDIT or sel_verts.is_empty()
 
 
 ## The tool column: the pointers, then the tools this mode has, then
@@ -451,6 +474,7 @@ func _refresh_toolbar() -> void:
 		match id:
 			"SELECT", "MOVE": dis = false
 			"DELETE", "DUPLICATE": dis = not can_delete
+			"MERGE", "FILL": dis = mode != Mode.EDIT or sel_verts.size() < 2
 			_: dis = not tool_available(id) and not (tool_live() and tool_kind() == id)
 		items.append({"id": id, "text": id, "icon": entry[1], "disabled": dis})
 	toolbar.set_items(items)
@@ -471,7 +495,8 @@ func _refresh_props() -> void:
 		rows.append({"id": "_none", "text": "NOTHING SELECTED", "inert": true, "disabled": true})
 		props_list.set_items(rows)
 		return
-	rows.append({"id": "_name", "text": o.name, "icon": &"group" if o.is_group else &"mesh", "inert": true})
+	# The name: tap it to rename.
+	rows.append({"id": "rename", "text": o.name, "icon": &"group" if o.is_group else &"mesh", "value": "RENAME"})
 	# Location, rotation and scale are fields: drag one sideways to change it.
 	rows.append({"id": "_tl", "text": "LOCATION", "heading": true})
 	for i in 3:
@@ -482,18 +507,143 @@ func _refresh_props() -> void:
 	rows.append({"id": "_ts", "text": "SCALE", "heading": true})
 	for i in 3:
 		rows.append({"id": "scl%d" % i, "text": "XYZ"[i], "value": "%.3f" % o.scale[i], "value_clock": true, "scrub": true})
-	if o.has_mesh():
+	if not o.is_group:
+		rows.append({"id": "_tsh", "text": "SHADING", "heading": true})
+		rows.append({"id": "smooth", "text": "SHADE SMOOTH", "on": o.smooth})
+		_modifier_rows(o, rows)
 		rows.append({"id": "_tm", "text": "MESH", "heading": true})
 		rows.append({"id": "_mv", "text": "VERTS", "value": "%03d" % o.data.vert_count(), "value_clock": true, "inert": true})
 		rows.append({"id": "_me", "text": "EDGES", "value": "%03d" % o.data.edge_count(), "value_clock": true, "inert": true})
 		rows.append({"id": "_mf", "text": "FACES", "value": "%03d" % o.data.face_count(), "value_clock": true, "inert": true})
+		if not o.modifiers.is_empty() and o.evaluated != null:
+			rows.append({"id": "_mr", "text": "RESULT FACES", "value": "%03d" % o.evaluated.face_count(), "value_clock": true, "inert": true})
 	elif o.is_group:
 		rows.append({"id": "_tg", "text": "GROUP", "heading": true})
 		rows.append({"id": "_gc", "text": "CHILDREN", "value": "%03d" % o.child_objects().size(), "value_clock": true, "inert": true})
 	props_list.set_items(rows)
 
 
+## The modifier stack, Blender's way: each modifier a row you tap to show or
+## hide it, its settings hanging under it, then APPLY and REMOVE; ADD
+## MODIFIER at the end. Ids are "m<index>:<setting>".
+func _modifier_rows(o: SceneObject, rows: Array[Dictionary]) -> void:
+	rows.append({"id": "_tmod", "text": "MODIFIERS", "heading": true})
+	for i in o.modifiers.size():
+		var mod: Dictionary = o.modifiers[i]
+		var k := "m%d:" % i
+		rows.append({"id": k + "show", "text": mod.type, "icon": _modifier_icon(mod.type), "on": mod.show})
+		var sub: Array[Dictionary] = []
+		match mod.type:
+			"SUBDIVISION":
+				sub.append({"id": k + "levels", "text": "LEVELS", "value": "%d" % int(mod.levels), "value_clock": true, "scrub": true})
+			"MIRROR":
+				for a in 3:
+					sub.append({"id": k + "ax%d" % a, "text": "AXIS " + "XYZ"[a], "on": bool(mod.axes[a])})
+			"ARRAY":
+				sub.append({"id": k + "count", "text": "COUNT", "value": "%d" % int(mod.count), "value_clock": true, "scrub": true})
+				sub.append({"id": k + "axis", "text": "AXIS", "value": "XYZ"[int(mod.axis)]})
+				sub.append({"id": k + "gap", "text": "OFFSET", "value": "%.2f" % float(mod.gap), "value_clock": true, "scrub": true})
+		sub.append({"id": k + "apply", "text": "APPLY"})
+		sub.append({"id": k + "remove", "text": "REMOVE"})
+		for j in sub.size():
+			var row := sub[j]
+			row.depth = 1
+			row.tree = [false]
+			row.last = j == sub.size() - 1
+			rows.append(row)
+	rows.append({"id": "addmod", "text": "ADD MODIFIER", "icon": &"add"})
+
+
+static func _modifier_icon(t: String) -> StringName:
+	match t:
+		"SUBDIVISION": return &"subdiv"
+		"MIRROR": return &"mirror"
+		"ARRAY": return &"array"
+	return &"wrench"
+
+
+static func _mod_key(id: String) -> Array:
+	# "m2:levels" -> [2, "levels"]; anything else -> [].
+	if not id.begins_with("m") or not id.contains(":"):
+		return []
+	var parts := id.substr(1).split(":")
+	if parts.size() != 2 or not parts[0].is_valid_int():
+		return []
+	return [int(parts[0]), parts[1]]
+
+
+func _on_prop_tapped(id: Variant) -> void:
+	var o := active_object
+	if o == null or not (id is String):
+		return
+	if id == "rename":
+		ask_rename()
+		return
+	if id == "addmod":
+		open_popover("MODIFIER")
+		return
+	if id == "smooth":
+		_tool_finish()
+		_mark_before()
+		o.smooth = not o.smooth
+		o.rebuild()
+		push_undo("SHADE SMOOTH" if o.smooth else "SHADE FLAT")
+		return
+	var mk := _mod_key(id)
+	if mk.is_empty() or mk[0] >= o.modifiers.size():
+		return
+	var i: int = mk[0]
+	var what: String = mk[1]
+	var mod: Dictionary = o.modifiers[i]
+	_tool_finish()
+	_mark_before()
+	match what:
+		"show": mod.show = not mod.show
+		"ax0", "ax1", "ax2":
+			var a := int(what.substr(2))
+			mod.axes[a] = not mod.axes[a]
+		"axis": mod.axis = (int(mod.axis) + 1) % 3
+		"levels": mod.levels = (int(mod.levels) + 1) % (SceneObject.MAX_LEVELS + 1)
+		"count": mod.count = int(mod.count) % 8 + 1
+		"gap": pass
+		"apply":
+			o.data = SceneObject.apply_modifier(o.data, mod)
+			o.modifiers.remove_at(i)
+			_clear_elems()
+		"remove":
+			o.modifiers.remove_at(i)
+	if what == "gap":
+		_before = {}
+		return
+	o.rebuild()
+	push_undo("APPLY " + mod.type if what == "apply" else "MODIFIER")
+
+
+func _on_modifier_menu_tapped(id: Variant) -> void:
+	close_popover()
+	add_modifier(String(id))
+
+
+func add_modifier(type: String) -> void:
+	var o := active_object
+	if o == null or o.is_group:
+		return
+	_tool_finish()
+	_mark_before()
+	o.modifiers.append(SceneObject.new_modifier(type))
+	o.rebuild()
+	push_undo("ADD " + type)
+
+
 func _prop_get(id: String) -> float:
+	var mk := _mod_key(id)
+	if not mk.is_empty():
+		var mod: Dictionary = active_object.modifiers[mk[0]]
+		match mk[1]:
+			"levels": return float(mod.levels)
+			"count": return float(mod.count)
+			"gap": return float(mod.gap)
+		return 0.0
 	var i := int(id.substr(3))
 	match id.left(3):
 		"loc": return active_object.position[i]
@@ -502,6 +652,15 @@ func _prop_get(id: String) -> float:
 
 
 func _prop_set(id: String, v: float) -> void:
+	var mk := _mod_key(id)
+	if not mk.is_empty():
+		var mod: Dictionary = active_object.modifiers[mk[0]]
+		match mk[1]:
+			"levels": mod.levels = clampi(int(v), 0, SceneObject.MAX_LEVELS)
+			"count": mod.count = clampi(int(v), 1, 32)
+			"gap": mod.gap = clampf(v, -5.0, 5.0)
+		active_object.rebuild()
+		return
 	var i := int(id.substr(3))
 	match id.left(3):
 		"loc":
@@ -519,7 +678,12 @@ func _prop_set(id: String, v: float) -> void:
 
 
 func _on_prop_scrub_started(id: Variant) -> void:
-	if active_object == null or not (id is String) or not id.left(3) in ["loc", "rot", "scl"]:
+	if active_object == null or not (id is String):
+		return
+	var mk := _mod_key(id)
+	if mk.is_empty() and not id.left(3) in ["loc", "rot", "scl"]:
+		return
+	if not mk.is_empty() and not mk[1] in ["levels", "count", "gap"]:
 		return
 	_tool_finish()
 	_mark_before()
@@ -530,6 +694,15 @@ func _on_prop_scrub_started(id: Variant) -> void:
 ## a percent of scale per pixel, rounded to what the field shows.
 func _on_prop_scrubbed(id: Variant, dx: float) -> void:
 	if active_object == null or not (id is String) or _before.is_empty():
+		return
+	var mk := _mod_key(id)
+	if not mk.is_empty():
+		# Whole steps for levels and counts, every 40 and 25 pixels.
+		match mk[1]:
+			"levels": _prop_set(id, _scrub_start + roundf(dx / 40.0))
+			"count": _prop_set(id, _scrub_start + roundf(dx / 25.0))
+			"gap": _prop_set(id, snappedf(_scrub_start + dx * 0.01, 0.05))
+		_refresh_props()
 		return
 	match id.left(3):
 		"loc": _prop_set(id, snappedf(_scrub_start + dx * 0.01, 0.01))
@@ -542,7 +715,7 @@ func _on_prop_scrub_ended(id: Variant) -> void:
 	if active_object == null or _before.is_empty():
 		return
 	if not is_equal_approx(_prop_get(id), _scrub_start):
-		push_undo("PROPERTIES")
+		push_undo("MODIFIER" if not _mod_key(id).is_empty() else "PROPERTIES")
 	_before = {}
 
 
@@ -615,6 +788,7 @@ func open_popover(kind: String) -> void:
 	add_menu.visible = kind == "ADD"
 	file_menu.visible = kind == "FILE"
 	select_menu.visible = kind == "SELECT"
+	modifier_menu.visible = kind == "MODIFIER"
 	matcap_grid.visible = kind == "SHADING"
 	if kind == "FILE":
 		_refresh_file_menu()
@@ -632,6 +806,7 @@ func close_popover() -> void:
 	add_menu.visible = false
 	file_menu.visible = false
 	select_menu.visible = false
+	modifier_menu.visible = false
 	matcap_grid.visible = false
 	_refresh_lists()
 
@@ -644,10 +819,13 @@ func _place_popover() -> void:
 		"ADD": anchor = add_bar.position
 		"FILE": anchor = file_bar.position
 		"SELECT": anchor = select_bar.position
+		"MODIFIER": anchor = Vector2(view_rect.end.x - POPOVER_W, 0.0)
 		_:
 			var i := toggle_list.index_of(popover_kind)
 			anchor = toggle_list.position + toggle_list.row_rect(maxi(i, 0)).position
 	var top := view_rect.position.y - 2.0
+	if popover_kind == "MODIFIER":
+		top = props_panel.position.y
 	var menu: RowList = _menu_for(popover_kind)
 	if menu != null:
 		menu.size = Vector2(POPOVER_W - 8.0, 0.0)
@@ -670,6 +848,7 @@ func _menu_for(kind: String) -> RowList:
 		"ADD": return add_menu
 		"FILE": return file_menu
 		"SELECT": return select_menu
+		"MODIFIER": return modifier_menu
 	return null
 
 
@@ -753,6 +932,10 @@ func _on_toolbar_tapped(id: Variant) -> void:
 			delete_selected()
 		"DUPLICATE":
 			duplicate_selected()
+		"MERGE":
+			merge_selected()
+		"FILL":
+			fill_selected()
 		_:
 			pointer = Pointer.TOOL
 			current_tool = id
@@ -769,7 +952,7 @@ func _refresh_file_menu() -> void:
 	var rows: Array[Dictionary] = [
 		{"id": "NEW", "text": "NEW"},
 		{"id": "SAVE", "text": "SAVE", "value": scene_name if scene_name != "" else "NEW FILE"},
-		{"id": "SAVE AS", "text": "SAVE AS NEW", "disabled": scene_name == ""},
+		{"id": "SAVE AS", "text": "SAVE AS..."},
 	]
 	var saved := SceneFile.list()
 	rows.append({"id": "_open", "text": "OPEN", "heading": true})
@@ -787,11 +970,58 @@ func _on_file_tapped(id: Variant) -> void:
 	match id:
 		"NEW": file_new()
 		"SAVE": file_save(false)
-		"SAVE AS": file_save(true)
+		"SAVE AS": ask_save_as()
 		"OBJ": file_export()
 		_:
 			if String(id).begins_with("open:"):
 				file_open(String(id).substr(5))
+
+
+# --- names ---------------------------------------------------------------------
+
+func ask_rename() -> void:
+	if active_object == null:
+		return
+	_tool_finish()
+	_prompt_for = "RENAME"
+	prompt.ask("RENAME OBJECT", active_object.name)
+
+
+func ask_save_as() -> void:
+	_tool_finish()
+	_prompt_for = "SAVE AS"
+	prompt.ask("SAVE SCENE AS", scene_name if scene_name != "" else SceneFile.next_name())
+
+
+func _on_prompt_submitted(text: String) -> void:
+	var what := _prompt_for
+	_prompt_for = ""
+	match what:
+		"RENAME":
+			if active_object != null:
+				rename_object(active_object, text)
+		"SAVE AS":
+			file_save_as(text)
+
+
+func _on_hierarchy_double_tapped(id: Variant) -> void:
+	var o := instance_from_id(id) as SceneObject
+	if o != null and o == active_object:
+		ask_rename()
+
+
+## A node name may not hold . : @ / " or %, and two objects may not share
+## one: a clash gets the next free number.
+func rename_object(o: SceneObject, text: String) -> bool:
+	var clean := text.strip_edges()
+	for ch in [".", ":", "@", "/", "\"", "%"]:
+		clean = clean.replace(ch, "")
+	if clean == "" or clean == String(o.name):
+		return false
+	_mark_before()
+	o.name = _unique_name(clean, o)
+	push_undo("RENAME")
+	return true
 
 
 func _on_select_tapped(id: Variant) -> void:
@@ -834,6 +1064,17 @@ func file_save(as_new: bool) -> bool:
 	return true
 
 
+## Save under a name the user gives; an existing scene of that name is
+## written over.
+func file_save_as(fname: String) -> bool:
+	fname = SceneFile.clean_name(fname)
+	if fname == "":
+		flash("NO NAME GIVEN")
+		return false
+	scene_name = fname
+	return file_save(false)
+
+
 ## Open a saved scene, as one undo step (the scene before is an undo away).
 func file_open(fname: String) -> bool:
 	var data := SceneFile.load_scene(fname)
@@ -859,8 +1100,13 @@ func file_export() -> String:
 
 
 ## ALL, NONE or INVERT: objects in OBJECT mode, the element kind in EDIT.
+## LINKED, in EDIT: everything joined by edges to what is selected.
 func select_all(how: String) -> void:
 	_tool_finish()
+	if how == "LINKED":
+		if mode == Mode.EDIT and active_object != null and not sel_verts.is_empty():
+			select_verts(active_object.data.linked(sel_verts))
+		return
 	if mode == Mode.OBJECT:
 		var all := objects()
 		var pick: Array[SceneObject] = []
@@ -889,6 +1135,39 @@ func select_all(how: String) -> void:
 		Elem.VERT: select_verts(want)
 		Elem.EDGE: select_edges(want)
 		_: select_faces(want)
+
+
+## Merge the selected vertices into one at their centre.
+func merge_selected() -> void:
+	_tool_finish()
+	if mode != Mode.EDIT or active_object == null or sel_verts.size() < 2:
+		return
+	_mark_before()
+	var v := active_object.data.merge_at_center(sel_verts)
+	active_object.rebuild()
+	select_verts({v: true})
+	push_undo("MERGE")
+
+
+## Blender's F: an edge between two vertices, or a face.
+func fill_selected() -> void:
+	_tool_finish()
+	if mode != Mode.EDIT or active_object == null or sel_verts.size() < 2:
+		return
+	_mark_before()
+	var d := active_object.data
+	var keep := sel_verts.duplicate()
+	var f := d.fill(sel_verts, sel_edges)
+	if f == -1:
+		_before = {}
+		flash("NOTHING TO FILL")
+		return
+	active_object.rebuild()
+	if f >= 0:
+		select_faces({f: true})
+	else:
+		select_verts(keep)
+	push_undo("FILL")
 
 
 ## Copy the selection in place and leave MOVE as the pointer, so the next
@@ -931,6 +1210,9 @@ func _clone(o: SceneObject) -> SceneObject:
 		c = SceneObject.create_group("~%d" % _clone_n)
 	else:
 		c = SceneObject.create("~%d" % _clone_n, o.data.copy())
+		c.modifiers = o.modifiers.duplicate(true)
+		c.smooth = o.smooth
+		c.rebuild()
 	c.set_meta("base", _base_name(String(o.name)))
 	for child in o.child_objects():
 		var cc := _clone(child)
@@ -1384,7 +1666,7 @@ func _snapshot() -> Dictionary:
 	var recs := []
 	for o in objs:
 		recs.append({"name": String(o.name), "group": o.is_group, "parent": index.get(o.get_parent(), -1),
-				"xf": o.transform, "data": o.data.copy()})
+				"xf": o.transform, "data": o.data.copy(), "mods": o.modifiers.duplicate(true), "smooth": o.smooth})
 	var snap := _selection_state()
 	snap.objects = recs
 	snap.scene = scene_name
@@ -1411,6 +1693,9 @@ func _restore(snap: Dictionary) -> void:
 		parent.add_child(o)
 		o.name = r.name
 		o.transform = r.xf
+		o.modifiers = r.get("mods", []).duplicate(true)
+		o.smooth = r.get("smooth", false)
+		o.rebuild()
 		made.append(o)
 	sel_objects.clear()
 	for i in snap.sel:
@@ -1472,10 +1757,11 @@ func add_group() -> SceneObject:
 	return g
 
 
-func _unique_name(base: String) -> String:
+func _unique_name(base: String, except: SceneObject = null) -> String:
 	var taken := {}
 	for o in objects():
-		taken[o.name] = true
+		if o != except:
+			taken[o.name] = true
 	if not taken.has(base):
 		return base
 	var n := 1
@@ -2086,7 +2372,8 @@ func _input(event: InputEvent) -> void:
 				and not toggle_list.get_rect().has_point(press_pos) \
 				and not add_bar.get_rect().has_point(press_pos) \
 				and not file_bar.get_rect().has_point(press_pos) \
-				and not select_bar.get_rect().has_point(press_pos):
+				and not select_bar.get_rect().has_point(press_pos) \
+				and not (popover_kind == "MODIFIER" and props_list.get_rect().has_point(press_pos)):
 			close_popover()
 			get_viewport().set_input_as_handled()
 			return
@@ -2162,7 +2449,10 @@ func _key(k: InputEventKey) -> bool:
 			return true
 		KEY_S:
 			if ctrl:
-				file_save(k.shift_pressed)
+				if k.shift_pressed:
+					ask_save_as()
+				else:
+					file_save(false)
 			else:
 				_on_toolbar_tapped("SCALE")
 			return true
@@ -2196,6 +2486,18 @@ func _key(k: InputEventKey) -> bool:
 			if k.shift_pressed:
 				duplicate_selected()
 				return true
+		KEY_M:
+			merge_selected()
+			return true
+		KEY_F:
+			fill_selected()
+			return true
+		KEY_L:
+			select_all("LINKED")
+			return true
+		KEY_F2:
+			ask_rename()
+			return true
 		KEY_N:
 			if ctrl:
 				file_new()

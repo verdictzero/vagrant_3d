@@ -27,6 +27,11 @@ signal drag_dropped(from_id: Variant, to_id: Variant)   # to_id null: dropped on
 signal scrub_started(id: Variant)
 signal scrubbed(id: Variant, dx: float)                 # pixels from where it started
 signal scrub_ended(id: Variant)
+signal double_tapped(id: Variant)                       # a second tap on the same row, quickly
+
+const DOUBLE_TAP_MS := 400
+var _last_tap_id: Variant = null
+var _last_tap_ms := 0
 
 @export var horizontal := false
 @export var draggable := false
@@ -68,6 +73,8 @@ func _ready() -> void:
 
 func set_items(list: Array[Dictionary]) -> void:
 	items = list
+	# A list that got shorter must not stay scrolled past its end.
+	scroll = clampf(scroll, 0.0, max_scroll())
 	queue_redraw()
 
 
@@ -285,6 +292,13 @@ func _release(pos: Vector2) -> void:
 			drag_dropped.emit(id, to)
 	elif id != null:
 		tapped.emit(id)
+		var now := Time.get_ticks_msec()
+		if id == _last_tap_id and now - _last_tap_ms <= DOUBLE_TAP_MS:
+			_last_tap_ms = 0
+			double_tapped.emit(id)
+		else:
+			_last_tap_id = id
+			_last_tap_ms = now
 	queue_redraw()
 
 

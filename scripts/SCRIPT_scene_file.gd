@@ -33,6 +33,15 @@ static func next_name() -> String:
 	return "SCENE %03d" % i
 
 
+## A name the file system takes: no slashes or the other characters some
+## systems refuse, no leading or trailing space.
+static func clean_name(n: String) -> String:
+	var out := n.strip_edges()
+	for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"]:
+		out = out.replace(ch, "")
+	return out.strip_edges()
+
+
 static func path_of(scene_name: String) -> String:
 	return DIR + scene_name + EXT
 
@@ -47,7 +56,7 @@ static func save(scene_name: String, snap: Dictionary, matcap: int) -> bool:
 		objs.append({"name": r.name, "group": r.group, "parent": r.parent,
 				"xf": [b.x.x, b.x.y, b.x.z, b.y.x, b.y.y, b.y.z, b.z.x, b.z.y, b.z.z,
 					xf.origin.x, xf.origin.y, xf.origin.z],
-				"mesh": (r.data as MeshData).to_dict()})
+				"mesh": (r.data as MeshData).to_dict(), "modifiers": r.get("mods", []), "smooth": r.get("smooth", false)})
 	var doc := {"format": "vagrant3d", "version": VERSION, "matcap": matcap, "objects": objs}
 	var f := FileAccess.open(path_of(scene_name), FileAccess.WRITE)
 	if f == null:
@@ -70,8 +79,16 @@ static func load_scene(scene_name: String) -> Dictionary:
 		var a: Array = o.xf
 		var xf := Transform3D(Basis(Vector3(a[0], a[1], a[2]), Vector3(a[3], a[4], a[5]), Vector3(a[6], a[7], a[8])),
 				Vector3(a[9], a[10], a[11]))
+		var mods: Array = []
+		for mod in o.get("modifiers", []):
+			var m: Dictionary = mod
+			# JSON reads every number back as a float.
+			for k in ["levels", "count", "axis"]:
+				if m.has(k):
+					m[k] = int(m[k])
+			mods.append(m)
 		recs.append({"name": String(o.name), "group": bool(o.group), "parent": int(o.parent), "xf": xf,
-				"data": MeshData.from_dict(o.mesh)})
+				"data": MeshData.from_dict(o.mesh), "mods": mods, "smooth": bool(o.get("smooth", false))})
 	return {"objects": recs, "matcap": int(doc.get("matcap", 0))}
 
 
@@ -79,7 +96,8 @@ static func delete(scene_name: String) -> void:
 	DirAccess.remove_absolute(path_of(scene_name))
 
 
-## Every mesh object in world space, one OBJ object each. Faces wind
+## Every mesh object in world space, one OBJ object each, as it shows: with
+## its modifiers. Faces wind
 ## counter-clockwise seen from outside, which is OBJ's convention, and Y is
 ## up, which is OBJ's too (Blender turns it to Z up on import by default).
 static func obj_text(meshes: Array) -> String:
@@ -91,15 +109,16 @@ static func obj_text(meshes: Array) -> String:
 			continue
 		lines.append("o " + String(so.name).replace(" ", "_"))
 		var xf := so.global_transform
-		for v in so.data.verts:
+		var m: MeshData = so.evaluated if so.evaluated != null else so.data
+		for v in m.verts:
 			var w := xf * v
 			lines.append("v %.6f %.6f %.6f" % [w.x, w.y, w.z])
-		for face in so.data.faces:
+		for face in m.faces:
 			var parts := PackedStringArray(["f"])
 			for i in face:
 				parts.append(str(i + offset))
 			lines.append(" ".join(parts))
-		offset += so.data.verts.size()
+		offset += m.verts.size()
 	return "\n".join(lines) + "\n"
 
 

@@ -204,15 +204,24 @@ func faces_using_vert(v: int) -> Array[int]:
 
 # --- rendering ----------------------------------------------------------------
 
-## Flat-shaded triangle mesh. Vertices are split per face so every face has
-## its own normal; that is the clay look, and it is also what makes face
-## selection readable later. Faces here wind counter-clockwise seen from
-## outside (the right-hand rule gives the outward normal); Godot's front
-## faces wind CLOCKWISE, so each triangle is emitted reversed.
-func build_mesh() -> ArrayMesh:
+## The triangle mesh the view draws. Flat: every face its own normal, the
+## clay look. Smooth: each vertex the area-weighted average of the faces
+## round it. Faces here wind counter-clockwise seen from outside (the
+## right-hand rule gives the outward normal); Godot's front faces wind
+## CLOCKWISE, so each triangle is emitted reversed.
+func build_mesh(smooth := false) -> ArrayMesh:
 	var mesh := ArrayMesh.new()
 	if faces.is_empty():
 		return mesh
+	var vn := PackedVector3Array()
+	if smooth:
+		vn.resize(verts.size())
+		for f in faces.size():
+			var n := face_normal_raw(f)
+			for i in faces[f]:
+				vn[i] += n
+		for i in vn.size():
+			vn[i] = vn[i].normalized()
 	var pos := PackedVector3Array()
 	var nrm := PackedVector3Array()
 	for f in faces.size():
@@ -220,7 +229,7 @@ func build_mesh() -> ArrayMesh:
 		for tri in face_triangles(f):
 			for i in [tri[0], tri[2], tri[1]]:
 				pos.append(verts[i])
-				nrm.append(n)
+				nrm.append(vn[i] if smooth else n)
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = pos
@@ -943,3 +952,283 @@ static func from_dict(d: Dictionary) -> MeshData:
 	for w in d.get("wires", []):
 		m._add_edge(int(w[0]), int(w[1]))
 	return m
+
+
+# --- modifiers ------------------------------------------------------------------------
+#
+# Each returns a new mesh and leaves this one alone: the object keeps its
+# cage and shows the result.
+
+## One level of Catmull-Clark. Every face becomes a quad per corner; a
+## border keeps its line (the boundary rule), and a corner of a border with
+## more or fewer than two border edges stays put.
+func catmull_clark() -> MeshData:
+	var out := MeshData.new()
+	var nv := verts.size()
+	var efm := edge_face_map()
+	var fp := PackedVector3Array()
+	for f in faces.size():
+		fp.append(face_center(f))
+	# Per vertex: faces, edges, border neighbours.
+	var v_faces := []
+	var v_edges := []
+	var v_border := []
+	for i in nv:
+		v_faces.append([])
+		v_edges.append([])
+		v_border.append([])
+	for f in faces.size():
+		for i in faces[f]:
+			v_faces[i].append(f)
+	for e in edges:
+		v_edges[e.x].append(e)
+		v_edges[e.y].append(e)
+		if efm[e].size() == 1:
+			v_border[e.x].append(e.y)
+			v_border[e.y].append(e.x)
+	for i in nv:
+		var v := verts[i]
+		var fs: Array = v_faces[i]
+		var es: Array = v_edges[i]
+		var bs: Array = v_border[i]
+		if fs.is_empty():
+			out.add_vert(v)
+		elif not bs.is_empty():
+			out.add_vert((verts[bs[0]] + verts[bs[1]] + v * 6.0) / 8.0 if bs.size() == 2 else v)
+		else:
+			var f_avg := Vector3.ZERO
+			for f in fs:
+				f_avg += fp[f]
+			f_avg /= float(fs.size())
+			var r_avg := Vector3.ZERO
+			for e in es:
+				r_avg += (verts[e.x] + verts[e.y]) * 0.5
+			r_avg /= float(es.size())
+			var n := float(es.size())
+			out.add_vert((f_avg + r_avg * 2.0 + v * (n - 3.0)) / n)
+	var f_index := PackedInt32Array()
+	for f in faces.size():
+		f_index.append(out.add_vert(fp[f]))
+	var e_index := {}
+	for e in edges:
+		var fs: Array = efm[e]
+		var mid := (verts[e.x] + verts[e.y]) * 0.5
+		if fs.size() == 2:
+			mid = (verts[e.x] + verts[e.y] + fp[fs[0]] + fp[fs[1]]) * 0.25
+		e_index[e] = out.add_vert(mid)
+	for f in faces.size():
+		var idx := faces[f]
+		var n := idx.size()
+		for i in n:
+			var a := idx[i]
+			var b := idx[(i + 1) % n]
+			var z := idx[(i - 1 + n) % n]
+			out.add_face(PackedInt32Array([a, e_index[Vector2i(mini(a, b), maxi(a, b))], f_index[f],
+					e_index[Vector2i(mini(z, a), maxi(z, a))]]))
+	for e in efm:
+		if efm[e].is_empty():
+			out._add_edge(e.x, e_index[e])
+			out._add_edge(e_index[e], e.y)
+	return out
+
+
+func subdivided(levels: int) -> MeshData:
+	var m := self
+	for i in levels:
+		m = m.catmull_clark()
+	return m if levels > 0 else copy()
+
+
+## Mirrored across the plane through the origin square to `axis` (0 x, 1 y,
+## 2 z). Vertices on the plane (within `eps`) are shared, so the halves join.
+func mirrored(axis: int, eps := 0.001) -> MeshData:
+	var out := copy()
+	var n := verts.size()
+	var map := PackedInt32Array()
+	map.resize(n)
+	for i in n:
+		var v := verts[i]
+		if absf(v[axis]) <= eps:
+			v[axis] = 0.0
+			out.verts[i] = v
+			map[i] = i
+		else:
+			v[axis] = -v[axis]
+			map[i] = out.add_vert(v)
+	for f in faces:
+		var on_plane := true
+		for i in f:
+			on_plane = on_plane and map[i] == i
+		if on_plane:
+			continue
+		var nf := PackedInt32Array()
+		for k in range(f.size() - 1, -1, -1):
+			nf.append(map[f[k]])
+		out.add_face(nf)
+	for e in edges:
+		out._add_edge(map[e.x], map[e.y])
+	return out
+
+
+## `count` copies in a row along `axis`, each the mesh's own width times
+## `gap` from the last (1 is touching, Blender's relative offset).
+func arrayed(count: int, axis: int, gap: float) -> MeshData:
+	var out := copy()
+	if count <= 1 or verts.is_empty():
+		return out
+	var lo := INF
+	var hi := -INF
+	for v in verts:
+		lo = minf(lo, v[axis])
+		hi = maxf(hi, v[axis])
+	var step := Vector3.ZERO
+	step[axis] = (hi - lo) * gap
+	var n := verts.size()
+	for k in range(1, count):
+		var base := out.verts.size()
+		for v in verts:
+			out.add_vert(v + step * float(k))
+		for f in faces:
+			var nf := PackedInt32Array()
+			for i in f:
+				nf.append(i + base)
+			out.add_face(nf)
+		for e in edges:
+			out._add_edge(e.x + base, e.y + base)
+	return out
+
+
+# --- merge, fill, linked --------------------------------------------------------------
+
+## Merge the selected vertices into one at their centre. Faces that lose
+## all but two corners go; edges that collapse go. Returns the vertex.
+func merge_at_center(sel_v: Dictionary) -> int:
+	if sel_v.size() < 2:
+		return sel_v.keys()[0] if sel_v.size() == 1 else -1
+	var keep: int = sel_v.keys().min()
+	var c := Vector3.ZERO
+	for v in sel_v:
+		c += verts[v]
+	verts[keep] = c / float(sel_v.size())
+	var old_faces := faces
+	var old_edges := edges
+	faces = []
+	edges = []
+	_edge_index = {}
+	var to := func(i: int) -> int: return keep if sel_v.has(i) else i
+	for f in old_faces:
+		var nf := PackedInt32Array()
+		for i in f:
+			var j: int = to.call(i)
+			if nf.is_empty() or nf[nf.size() - 1] != j:
+				nf.append(j)
+		if nf.size() > 1 and nf[0] == nf[nf.size() - 1]:
+			nf.remove_at(nf.size() - 1)
+		if nf.size() >= 3:
+			add_face(nf)
+	for e in old_edges:
+		var a: int = to.call(e.x)
+		var b: int = to.call(e.y)
+		if a != b:
+			_add_edge(a, b)
+	var remap := compact()
+	return remap[keep]
+
+
+## Blender's F: two vertices get an edge; selected edges that run round a
+## hole close it with a face; otherwise three or more vertices make a face,
+## in order round their centre. The new face turns the way the faces next
+## to it do. Returns the new face (or -1, and -2 for an edge).
+func fill(sel_v: Dictionary, sel_e: Dictionary) -> int:
+	if sel_v.size() == 2:
+		var k: Array = sel_v.keys()
+		if edge_index(k[0], k[1]) >= 0:
+			return -1
+		_add_edge(k[0], k[1])
+		return -2
+	if sel_v.size() < 3:
+		return -1
+	# A loop of open edges: walk it the way the faces beside it do not.
+	var efm := edge_face_map()
+	var nxt := {}
+	var loop_ok := not sel_e.is_empty()
+	for e in sel_e:
+		var key: Vector2i = edges[e]
+		var fs: Array = efm[key]
+		if fs.size() > 1:
+			loop_ok = false
+			break
+		var a := key.x
+		var b := key.y
+		if fs.size() == 1 and face_runs(fs[0], a, b):
+			nxt[b] = a
+		else:
+			nxt[a] = b
+	if loop_ok and nxt.size() == sel_v.size():
+		var start: int = nxt.keys()[0]
+		var ring := PackedInt32Array([start])
+		var cur: int = nxt[start]
+		while cur != start and nxt.has(cur) and ring.size() <= nxt.size():
+			ring.append(cur)
+			cur = nxt[cur]
+		if cur == start and ring.size() == sel_v.size():
+			add_face(ring)
+			return faces.size() - 1
+	# Otherwise: round the centre, facing the way the faces round them do.
+	var c := Vector3.ZERO
+	var n := Vector3.ZERO
+	for v in sel_v:
+		c += verts[v]
+		for f in faces.size():
+			if faces[f].has(v):
+				n += face_normal(f)
+	c /= float(sel_v.size())
+	if n.length_squared() < 1e-8:
+		var ks: Array = sel_v.keys()
+		n = (verts[ks[1]] - verts[ks[0]]).cross(verts[ks[2]] - verts[ks[0]])
+	n = n.normalized() if n.length_squared() > 1e-12 else Vector3.UP
+	var u := (verts[sel_v.keys()[0]] - c).normalized()
+	if u.length_squared() < 1e-8:
+		u = n.cross(Vector3.RIGHT if absf(n.x) < 0.9 else Vector3.UP).normalized()
+	var w := n.cross(u)
+	var order: Array = sel_v.keys()
+	order.sort_custom(func(a, b):
+		var da: Vector3 = verts[a] - c
+		var db: Vector3 = verts[b] - c
+		return atan2(da.dot(w), da.dot(u)) < atan2(db.dot(w), db.dot(u)))
+	# Where the new face closes against existing edges, it must run them the
+	# other way from the faces already on them. That outvotes the normals.
+	var votes := 0
+	for i in order.size():
+		var a: int = order[i]
+		var b: int = order[(i + 1) % order.size()]
+		var key := Vector2i(mini(a, b), maxi(a, b))
+		if not efm.has(key):
+			continue
+		for g in efm[key]:
+			votes += -1 if face_runs(g, a, b) else 1
+	if votes < 0:
+		order.reverse()
+	add_face(PackedInt32Array(order))
+	return faces.size() - 1
+
+
+## Every vertex joined by edges to one in `sel_v`.
+func linked(sel_v: Dictionary) -> Dictionary:
+	var nbr := {}
+	for e in edges:
+		if not nbr.has(e.x):
+			nbr[e.x] = []
+		if not nbr.has(e.y):
+			nbr[e.y] = []
+		nbr[e.x].append(e.y)
+		nbr[e.y].append(e.x)
+	var out := sel_v.duplicate()
+	var todo: Array = sel_v.keys()
+	while not todo.is_empty():
+		var v: int = todo.pop_back()
+		for w in nbr.get(v, []):
+			if not out.has(w):
+				out[w] = true
+				todo.append(w)
+	return out
